@@ -1,0 +1,10 @@
+{
+  "domain": "dynenergy",
+  "name": "DynEnergy",
+  "codeowners": ["@rotarucalin"],
+  "config_flow": true,
+  "documentation": "https://github.com/rotarucalin/dynenergy",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "version": "0.1.0"
+}

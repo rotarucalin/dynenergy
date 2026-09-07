@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "price_entity": "EPEX day-ahead price entity",
+          "soc_entity": "Battery state of charge entity",
+          "battery_power_entity": "Battery power entity (negative charging, positive discharging)",
+          "capacity_entity": "Usable battery capacity entity (kWh)",
+          "max_charge_power_entity": "Maximum charging power entity (kW)",
+          "max_discharge_power_entity": "Maximum discharging power entity (kW)",
+          "grid_import_energy_entity": "Cumulative grid import energy entity (kWh)",
+          "min_soc_percent": "Minimum state of charge (%)",
+          "max_soc_percent": "Maximum state of charge (%)",
+          "charge_efficiency": "Charging efficiency",
+          "discharge_efficiency": "Discharging efficiency",
+          "degradation_cost": "Battery degradation cost per kWh"
+        },
+        "error": {
+          "max_soc_must_exceed_min_soc": "Maximum state of charge must exceed the minimum."
+        }
+      }
+    }
+  }
+}
