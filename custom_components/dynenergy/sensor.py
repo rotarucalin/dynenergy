@@ -91,7 +91,7 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
                     "price_per_kwh": interval.price_per_kwh,
                     "consumption_kwh": interval.consumption_kwh,
                     "target_battery_power_w": int(
-                        interval.target_battery_power_kw * 1000
+                        interval.target_battery_power_kw * 4 * 1000
                     ),
                     "expected_soc_percent": interval.expected_soc_percent,
                     "state": interval.state.value,
