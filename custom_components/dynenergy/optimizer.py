@@ -183,15 +183,22 @@ def create_greedy_charge_plan(
         default=-1,
     )
 
-    if last_charge_index >= 0:
-        _allocate_discharge(
-            inputs,
-            discharge_energy_by_index,
-            available_energy_kwh=remaining_energy_after_charge_kwh
-            - minimum_energy_kwh,
-            candidate_indices=range(last_charge_index + 1, len(inputs.timestamps)),
-            minimum_price_per_kwh=thresholds.post_charge_discharge_per_kwh,
-        )
+    # Without a charge interval the remaining energy was never bought cheaply,
+    # so it is released from the first charge candidate at the pre-charge threshold.
+    _allocate_discharge(
+        inputs,
+        discharge_energy_by_index,
+        available_energy_kwh=remaining_energy_after_charge_kwh - minimum_energy_kwh,
+        candidate_indices=range(
+            last_charge_index + 1 if last_charge_index >= 0 else first_charge_index,
+            len(inputs.timestamps),
+        ),
+        minimum_price_per_kwh=(
+            thresholds.post_charge_discharge_per_kwh
+            if last_charge_index >= 0
+            else thresholds.pre_charge_discharge_per_kwh
+        ),
+    )
 
     intervals: list[PlanInterval] = []
     expected_energy_kwh = initial_energy_kwh
@@ -362,7 +369,7 @@ def _validate_charge_inputs(
         raise ValueError("Charge and discharge efficiency must be between 0 and 1")
     if not 0 <= battery.min_soc_percent < battery.max_soc_percent <= 100:
         raise ValueError("Battery SOC limits must be ordered percentages between 0 and 100")
-    if not battery.min_soc_percent <= inputs.current_soc_percent <= battery.max_soc_percent:
-        raise ValueError("Current SOC must be within the configured SOC limits")
+    if not 0 <= inputs.current_soc_percent <= 100:
+        raise ValueError("Current SOC must be a percentage between 0 and 100")
     if charge_price_threshold_per_kwh < 0:
         raise ValueError("Charge price threshold must not be negative")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import timedelta
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
@@ -10,9 +11,11 @@ from homeassistant.const import UnitOfCurrency
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, DOMAIN
 from .coordinator import DynEnergyCoordinator
+from .optimizer import INTERVAL_HOURS
 
 
 async def async_setup_entry(
@@ -38,6 +41,7 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
     _attr_has_entity_name = True
     _attr_name = "Battery plan"
     _attr_icon = "mdi:battery-clock-outline"
+    _unrecorded_attributes = frozenset({"intervals", "summary"})
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
         """Initialize the plan sensor."""
@@ -76,20 +80,25 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             "stored_energy_kwh": data.account.stored_energy_kwh,
             "stored_energy_cost_eur": data.account.stored_energy_cost_eur,
             "charge_price_threshold_per_kwh": self.coordinator.entry.data.get(
-                "charge_price_threshold", 0.10
+                CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH
             ),
         }
         if data.plan:
+            local_now = dt_util.now()
             attributes["summary"] = asdict(data.plan.summary)
             attributes["intervals"] = [
                 {
-                    **asdict(interval),
                     "timestamp": interval.timestamp.isoformat(),
+                    "price_per_kwh": interval.price_per_kwh,
+                    "consumption_kwh": interval.consumption_kwh,
                     "target_battery_power_w": int(
                         interval.target_battery_power_kw * 1000
                     ),
+                    "expected_soc_percent": interval.expected_soc_percent,
+                    "state": interval.state.value,
                 }
                 for interval in data.plan.intervals
+                if interval.timestamp + timedelta(hours=INTERVAL_HOURS) > local_now
             ]
         return attributes
 

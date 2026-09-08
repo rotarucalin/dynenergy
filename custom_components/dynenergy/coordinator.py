@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_change
@@ -49,6 +50,18 @@ from .optimizer import (
 
 LOGGER = logging.getLogger(__name__)
 
+_POWER_SCALE_TO_KW: Mapping[str, float] = {
+    UnitOfPower.WATT: 0.001,
+    UnitOfPower.KILO_WATT: 1.0,
+    UnitOfPower.MEGA_WATT: 1000.0,
+}
+_ENERGY_SCALE_TO_KWH: Mapping[str, float] = {
+    UnitOfEnergy.WATT_HOUR: 0.001,
+    UnitOfEnergy.KILO_WATT_HOUR: 1.0,
+    UnitOfEnergy.MEGA_WATT_HOUR: 1000.0,
+}
+_ACCOUNT_SAVE_INTERVAL_MINUTES = 5
+
 
 @dataclass(frozen=True, slots=True)
 class DynEnergyData:
@@ -85,6 +98,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self._unsub_monitor: Callable[[], None] | None = None
         self._last_target_power_w: int | None = None
         self._account = BatteryCostAccount()
+        self._account_dirty = False
         self._account_store: Store[dict[str, object]] = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.account"
         )
@@ -114,17 +128,22 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             second=0,
         )
         await self._async_monitor_battery_energy(dt_util.now())
+        await self._async_restore_plan()
         await self._async_apply_scheduled_power(dt_util.now())
 
     async def async_shutdown(self) -> None:
         """Stop scheduled callbacks and leave the charge target idle."""
-        if self._unsub_plan:
-            self._unsub_plan()
-        if self._unsub_apply:
-            self._unsub_apply()
-        if self._unsub_monitor:
-            self._unsub_monitor()
+        for unsubscribe in (self._unsub_plan, self._unsub_apply, self._unsub_monitor):
+            if unsubscribe:
+                unsubscribe()
+        self._unsub_plan = None
+        self._unsub_apply = None
+        self._unsub_monitor = None
         await self._async_set_battery_power_target(0)
+        if self._account_dirty:
+            await self._account_store.async_save(self._account.as_dict())
+            self._account_dirty = False
+        await super().async_shutdown()
 
     async def _async_update_data(self) -> DynEnergyData:
         """Read configured source entities without generating a new plan."""
@@ -135,7 +154,21 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def _async_create_next_day_plan(self, now: datetime) -> None:
         """Refresh EPEX data and generate tomorrow's plan at 23:50 local time."""
-        target_date = dt_util.as_local(now).date() + timedelta(days=1)
+        await self._async_refresh_plan(dt_util.as_local(now).date() + timedelta(days=1))
+
+    async def _async_restore_plan(self) -> None:
+        """Plan the remainder of today so a restart does not leave the battery idle."""
+        local_now = dt_util.now()
+        if (local_now.hour, local_now.minute) >= (PLAN_HOUR, PLAN_MINUTE):
+            await self._async_refresh_plan(local_now.date() + timedelta(days=1))
+            return
+        await self._async_refresh_plan(local_now.date(), not_before=local_now)
+
+    async def _async_refresh_plan(
+        self, target_date: date, not_before: datetime | None = None
+    ) -> None:
+        """Refresh EPEX data and replace the active plan for the target date."""
+        monitoring_error = self.data.monitoring_error if self.data else None
         try:
             await self.hass.services.async_call(
                 "homeassistant",
@@ -144,22 +177,19 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 blocking=True,
             )
             data = self._read_data()
-            plan = self._create_charge_plan(data, target_date)
+            plan = self._create_charge_plan(data, target_date, not_before)
         except (HomeAssistantError, KeyError, TypeError, ValueError) as err:
             LOGGER.warning("Unable to create DynEnergy plan for %s: %s", target_date, err)
             self.async_set_updated_data(
                 self._read_data(
                     planning_error=str(err),
-                    monitoring_error=self.data.monitoring_error if self.data else None,
+                    monitoring_error=monitoring_error,
                 )
             )
             return
 
         self.async_set_updated_data(
-            self._read_data(
-                plan=plan,
-                monitoring_error=self.data.monitoring_error if self.data else None,
-            )
+            self._read_data(plan=plan, monitoring_error=monitoring_error)
         )
 
     async def _async_apply_scheduled_power(self, now: datetime) -> None:
@@ -181,6 +211,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         """Account for battery meter deltas at the current EPEX price each minute."""
         current_plan = self.data.plan if self.data else None
         planning_error = self.data.planning_error if self.data else None
+        previous_account = self._account
         data = self._read_data(current_plan, planning_error)
         try:
             if (
@@ -222,7 +253,14 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             )
             return
 
-        await self._account_store.async_save(self._account.as_dict())
+        if self._account != previous_account:
+            self._account_dirty = True
+        if (
+            self._account_dirty
+            and dt_util.as_local(now).minute % _ACCOUNT_SAVE_INTERVAL_MINUTES == 0
+        ):
+            await self._account_store.async_save(self._account.as_dict())
+            self._account_dirty = False
         self.async_set_updated_data(self._read_data(current_plan, planning_error))
 
     async def _async_set_battery_power_target(self, target_power_w: int) -> None:
@@ -255,19 +293,27 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         return DynEnergyData(
             price_source_state=price_state.state if price_state else None,
             current_soc_percent=self._numeric_state(CONF_SOC_ENTITY),
-            current_battery_power=self._numeric_state(CONF_BATTERY_POWER_ENTITY),
+            current_battery_power=self._numeric_state(
+                CONF_BATTERY_POWER_ENTITY, _POWER_SCALE_TO_KW
+            ),
             battery_charged_energy_kwh=self._numeric_state(
-                CONF_BATTERY_CHARGED_ENERGY_ENTITY
+                CONF_BATTERY_CHARGED_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
             ),
             battery_discharged_energy_kwh=self._numeric_state(
-                CONF_BATTERY_DISCHARGED_ENERGY_ENTITY
+                CONF_BATTERY_DISCHARGED_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
             ),
-            usable_capacity_kwh=self._numeric_state(CONF_CAPACITY_ENTITY),
-            max_charge_power_kw=self._numeric_state(CONF_MAX_CHARGE_POWER_ENTITY),
+            usable_capacity_kwh=self._numeric_state(
+                CONF_CAPACITY_ENTITY, _ENERGY_SCALE_TO_KWH
+            ),
+            max_charge_power_kw=self._numeric_state(
+                CONF_MAX_CHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
+            ),
             max_discharge_power_kw=self._numeric_state(
-                CONF_MAX_DISCHARGE_POWER_ENTITY
+                CONF_MAX_DISCHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
             ),
-            grid_import_energy_kwh=self._numeric_state(CONF_GRID_IMPORT_ENERGY_ENTITY),
+            grid_import_energy_kwh=self._numeric_state(
+                CONF_GRID_IMPORT_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
+            ),
             account=self._account,
             plan=plan,
             planning_error=planning_error,
@@ -275,7 +321,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         )
 
     def _create_charge_plan(
-        self, data: DynEnergyData, target_date: date
+        self,
+        data: DynEnergyData,
+        target_date: date,
+        not_before: datetime | None = None,
     ) -> OptimizationPlan:
         """Build the greedy charging plan from EPEX prices and helper values."""
         required_values = {
@@ -288,7 +337,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         if missing:
             raise ValueError(f"Missing numeric input: {', '.join(missing)}")
 
-        timestamps, prices_per_kwh = self._target_day_prices(target_date)
+        timestamps, prices_per_kwh = self._target_day_prices(target_date, not_before)
         battery = BatteryParameters(
             usable_capacity_kwh=data.usable_capacity_kwh,
             max_charge_power_kw=data.max_charge_power_kw,
@@ -318,23 +367,26 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             ),
         )
 
-    def _target_day_prices(self, target_date: date) -> tuple[list[datetime], list[float]]:
+    def _target_day_prices(
+        self, target_date: date, not_before: datetime | None = None
+    ) -> tuple[list[datetime], list[float]]:
         """Extract target-day EPEX prices and expand hourly records to quarters."""
         price_state = self.hass.states.get(self.entry.data[CONF_PRICE_ENTITY])
         raw_data = price_state.attributes.get("data") if price_state else None
         if not isinstance(raw_data, Sequence) or isinstance(raw_data, str):
             raise ValueError("EPEX price entity must provide a data attribute")
 
+        local_not_before = dt_util.as_local(not_before) if not_before else None
         intervals: list[tuple[datetime, float]] = []
         for raw_interval in raw_data:
             if not isinstance(raw_interval, Mapping):
                 continue
             try:
-                start = datetime.fromisoformat(
-                    str(raw_interval["start_time"]).replace("Z", "+00:00")
+                start = dt_util.as_local(
+                    datetime.fromisoformat(str(raw_interval["start_time"]))
                 )
-                end = datetime.fromisoformat(
-                    str(raw_interval["end_time"]).replace("Z", "+00:00")
+                end = dt_util.as_local(
+                    datetime.fromisoformat(str(raw_interval["end_time"]))
                 )
                 price_per_kwh = float(raw_interval["price_per_kwh"])
             except (KeyError, TypeError, ValueError) as err:
@@ -344,14 +396,20 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 continue
             duration_seconds = end.timestamp() - start.timestamp()
             if duration_seconds == 15 * 60:
-                intervals.append((start, price_per_kwh))
+                quarter_starts = [start]
             elif duration_seconds == 60 * 60:
-                intervals.extend(
-                    (start + timedelta(minutes=15 * offset), price_per_kwh)
-                    for offset in range(4)
-                )
+                quarter_starts = [
+                    start + timedelta(minutes=15 * offset) for offset in range(4)
+                ]
             else:
                 raise ValueError("EPEX intervals must be 15 or 60 minutes long")
+
+            intervals.extend(
+                (quarter_start, price_per_kwh)
+                for quarter_start in quarter_starts
+                if local_not_before is None
+                or quarter_start + timedelta(minutes=15) > local_not_before
+            )
 
         intervals.sort(key=lambda interval: interval[0])
         if not intervals:
@@ -377,14 +435,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 continue
             try:
                 start = dt_util.as_local(
-                    datetime.fromisoformat(
-                        str(raw_interval["start_time"]).replace("Z", "+00:00")
-                    )
+                    datetime.fromisoformat(str(raw_interval["start_time"]))
                 )
                 end = dt_util.as_local(
-                    datetime.fromisoformat(
-                        str(raw_interval["end_time"]).replace("Z", "+00:00")
-                    )
+                    datetime.fromisoformat(str(raw_interval["end_time"]))
                 )
                 price_per_kwh = float(raw_interval["price_per_kwh"])
             except (KeyError, TypeError, ValueError) as err:
@@ -394,11 +448,30 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
         raise ValueError("No EPEX price available for the current interval")
 
-    def _numeric_state(self, config_key: str) -> float | None:
-        """Read a configured numeric helper or sensor state."""
+    def _numeric_state(
+        self,
+        config_key: str,
+        scale_by_unit: Mapping[str, float] | None = None,
+    ) -> float | None:
+        """Read a configured numeric helper or sensor state in its expected unit."""
         entity_id = self.entry.data.get(config_key)
         state = self.hass.states.get(entity_id) if entity_id else None
-        try:
-            return float(state.state) if state else None
-        except ValueError:
+        if state is None:
             return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+
+        if scale_by_unit is None:
+            return value
+        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if unit is None:
+            return value
+        scale = scale_by_unit.get(unit)
+        if scale is None:
+            LOGGER.warning(
+                "Unsupported unit %s on %s; using the raw value", unit, entity_id
+            )
+            return value
+        return value * scale
