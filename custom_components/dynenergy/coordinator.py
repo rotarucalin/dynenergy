@@ -208,7 +208,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 if interval.timestamp <= local_now < interval.timestamp + timedelta(
                     hours=INTERVAL_HOURS
                 ):
-                    target_power_w = int(interval.target_battery_power_kw * 1000)
+                    target_power_w = int(interval.target_battery_power_kw * 4 * 1000)
                     break
 
         await self._async_set_battery_power_target(target_power_w)
