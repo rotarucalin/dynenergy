@@ -54,9 +54,28 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             "max_charge_power_kw": data.max_charge_power_kw,
             "max_discharge_power_kw": data.max_discharge_power_kw,
             "grid_import_energy_kwh": data.grid_import_energy_kwh,
-            "optimization_status": "not_implemented" if data.plan is None else "ready",
+            "optimization_status": (
+                "failed"
+                if data.planning_error
+                else "waiting_for_23_50"
+                if data.plan is None
+                else "ready"
+            ),
+            "planning_error": data.planning_error,
+            "charge_price_threshold_per_kwh": self.coordinator.entry.data.get(
+                "charge_price_threshold", 0.10
+            ),
         }
         if data.plan:
             attributes["summary"] = asdict(data.plan.summary)
-            attributes["intervals"] = [asdict(interval) for interval in data.plan.intervals]
+            attributes["intervals"] = [
+                {
+                    **asdict(interval),
+                    "timestamp": interval.timestamp.isoformat(),
+                    "target_battery_power_w": int(
+                        interval.target_battery_power_kw * 1000
+                    ),
+                }
+                for interval in data.plan.intervals
+            ]
         return attributes

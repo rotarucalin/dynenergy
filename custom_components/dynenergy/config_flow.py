@@ -13,6 +13,8 @@ from .const import (
     CONF_BATTERY_POWER_ENTITY,
     CONF_CAPACITY_ENTITY,
     CONF_CHARGE_EFFICIENCY,
+    CONF_CHARGE_POWER_TARGET_ENTITY,
+    CONF_CHARGE_PRICE_THRESHOLD,
     CONF_DEGRADATION_COST,
     CONF_DISCHARGE_EFFICIENCY,
     CONF_GRID_IMPORT_ENERGY_ENTITY,
@@ -55,6 +57,14 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 default=defaults.get(CONF_GRID_IMPORT_ENERGY_ENTITY),
             ): selector.EntitySelector(),
             vol.Required(
+                CONF_CHARGE_POWER_TARGET_ENTITY,
+                default=defaults.get(CONF_CHARGE_POWER_TARGET_ENTITY),
+            ): selector.EntitySelector(),
+            vol.Required(
+                CONF_CHARGE_PRICE_THRESHOLD,
+                default=defaults.get(CONF_CHARGE_PRICE_THRESHOLD, 0.10),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Required(
                 CONF_MIN_SOC_PERCENT, default=defaults.get(CONF_MIN_SOC_PERCENT, 10.0)
             ): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
             vol.Required(
@@ -93,3 +103,26 @@ class DynEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(title="DynEnergy", data=user_input)
 
         return self.async_show_form(step_id="user", data_schema=_schema())
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Allow an installed integration to select newly required helpers."""
+        entry = self._get_reconfigure_entry()
+        if user_input is not None:
+            if user_input[CONF_MIN_SOC_PERCENT] >= user_input[CONF_MAX_SOC_PERCENT]:
+                return self.async_show_form(
+                    step_id="reconfigure",
+                    data_schema=_schema(user_input),
+                    errors={CONF_MAX_SOC_PERCENT: "max_soc_must_exceed_min_soc"},
+                )
+            return self.async_update_reload_and_abort(
+                entry,
+                data=user_input,
+                reason="reconfigure_successful",
+            )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_schema(dict(entry.data)),
+        )
