@@ -8,7 +8,12 @@ from datetime import date, datetime, timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, UnitOfEnergy, UnitOfPower
+from homeassistant.const import (
+    ATTR_UNIT_OF_MEASUREMENT,
+    PERCENTAGE,
+    UnitOfEnergy,
+    UnitOfPower,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_change
@@ -60,6 +65,7 @@ _ENERGY_SCALE_TO_KWH: Mapping[str, float] = {
     UnitOfEnergy.KILO_WATT_HOUR: 1.0,
     UnitOfEnergy.MEGA_WATT_HOUR: 1000.0,
 }
+_SOC_SCALE_TO_PERCENT: Mapping[str, float] = {PERCENTAGE: 1.0}
 _ACCOUNT_SAVE_INTERVAL_MINUTES = 5
 
 
@@ -292,7 +298,9 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
         return DynEnergyData(
             price_source_state=price_state.state if price_state else None,
-            current_soc_percent=self._numeric_state(CONF_SOC_ENTITY),
+            current_soc_percent=self._numeric_state(
+                CONF_SOC_ENTITY, _SOC_SCALE_TO_PERCENT
+            ),
             current_battery_power=self._numeric_state(
                 CONF_BATTERY_POWER_ENTITY, _POWER_SCALE_TO_KW
             ),

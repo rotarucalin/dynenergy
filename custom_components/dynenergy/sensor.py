@@ -134,7 +134,7 @@ class DynEnergyTotalChargingCostSensor(
     _attr_icon = "mdi:cash-plus"
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "EUR"
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
         """Initialize the total charging-cost sensor."""
@@ -157,7 +157,7 @@ class DynEnergyTotalSavedCostSensor(
     _attr_icon = "mdi:cash-check"
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "EUR"
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
         """Initialize the total savings sensor."""
