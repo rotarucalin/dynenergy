@@ -9,6 +9,8 @@
           "price_entity": "EPEX day-ahead price entity",
           "soc_entity": "Battery state of charge entity",
           "battery_power_entity": "Battery power entity (negative charging, positive discharging)",
+          "battery_charged_energy_entity": "Cumulative battery charged energy entity (kWh)",
+          "battery_discharged_energy_entity": "Cumulative battery discharged energy entity (kWh)",
           "capacity_entity": "Usable battery capacity entity (kWh)",
           "max_charge_power_entity": "Maximum charging power entity (kW)",
           "max_discharge_power_entity": "Maximum discharging power entity (kW)",

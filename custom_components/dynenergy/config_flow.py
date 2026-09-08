@@ -10,6 +10,8 @@ from homeassistant import config_entries
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_BATTERY_CHARGED_ENERGY_ENTITY,
+    CONF_BATTERY_DISCHARGED_ENERGY_ENTITY,
     CONF_BATTERY_POWER_ENTITY,
     CONF_CAPACITY_ENTITY,
     CONF_CHARGE_EFFICIENCY,
@@ -40,6 +42,14 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             vol.Required(
                 CONF_BATTERY_POWER_ENTITY,
                 default=defaults.get(CONF_BATTERY_POWER_ENTITY),
+            ): selector.EntitySelector(),
+            vol.Required(
+                CONF_BATTERY_CHARGED_ENERGY_ENTITY,
+                default=defaults.get(CONF_BATTERY_CHARGED_ENERGY_ENTITY),
+            ): selector.EntitySelector(),
+            vol.Required(
+                CONF_BATTERY_DISCHARGED_ENERGY_ENTITY,
+                default=defaults.get(CONF_BATTERY_DISCHARGED_ENERGY_ENTITY),
             ): selector.EntitySelector(),
             vol.Required(
                 CONF_CAPACITY_ENTITY, default=defaults.get(CONF_CAPACITY_ENTITY)

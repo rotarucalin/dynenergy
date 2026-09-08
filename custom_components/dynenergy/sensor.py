@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfCurrency
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -21,7 +22,14 @@ async def async_setup_entry(
 ) -> None:
     """Set up the DynEnergy plan sensor."""
     coordinator: DynEnergyCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([DynEnergyPlanSensor(coordinator, entry)])
+    async_add_entities(
+        [
+            DynEnergyPlanSensor(coordinator, entry),
+            DynEnergyStoredEnergyCostSensor(coordinator, entry),
+            DynEnergyTotalChargingCostSensor(coordinator, entry),
+            DynEnergyTotalSavedCostSensor(coordinator, entry),
+        ]
+    )
 
 
 class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity):
@@ -50,6 +58,8 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             "price_source_state": data.price_source_state,
             "current_soc_percent": data.current_soc_percent,
             "current_battery_power": data.current_battery_power,
+            "battery_charged_energy_kwh": data.battery_charged_energy_kwh,
+            "battery_discharged_energy_kwh": data.battery_discharged_energy_kwh,
             "usable_capacity_kwh": data.usable_capacity_kwh,
             "max_charge_power_kw": data.max_charge_power_kw,
             "max_discharge_power_kw": data.max_discharge_power_kw,
@@ -62,6 +72,9 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
                 else "ready"
             ),
             "planning_error": data.planning_error,
+            "monitoring_error": data.monitoring_error,
+            "stored_energy_kwh": data.account.stored_energy_kwh,
+            "stored_energy_cost_eur": data.account.stored_energy_cost_eur,
             "charge_price_threshold_per_kwh": self.coordinator.entry.data.get(
                 "charge_price_threshold", 0.10
             ),
@@ -79,3 +92,71 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
                 for interval in data.plan.intervals
             ]
         return attributes
+
+
+class DynEnergyStoredEnergyCostSensor(
+    CoordinatorEntity[DynEnergyCoordinator], SensorEntity
+):
+    """Expose the weighted-average EPEX cost of energy in the battery."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Stored energy cost"
+    _attr_icon = "mdi:battery-charging-medium"
+    _attr_native_unit_of_measurement = "ct/kWh"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the stored-energy cost sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_stored_energy_cost"
+
+    @property
+    def native_value(self) -> float:
+        """Return the current stored-energy weighted average in cents."""
+        return self.coordinator.data.account.stored_energy_cost_per_kwh * 100
+
+
+class DynEnergyTotalChargingCostSensor(
+    CoordinatorEntity[DynEnergyCoordinator], SensorEntity
+):
+    """Expose cumulative EPEX costs paid to charge the battery."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Total costs"
+    _attr_icon = "mdi:cash-plus"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = UnitOfCurrency.EURO
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the total charging-cost sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_total_costs"
+
+    @property
+    def native_value(self) -> float:
+        """Return cumulative charging costs in euros."""
+        return self.coordinator.data.account.total_charging_cost_eur
+
+
+class DynEnergyTotalSavedCostSensor(
+    CoordinatorEntity[DynEnergyCoordinator], SensorEntity
+):
+    """Expose cumulative EPEX savings from battery discharge."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Total savings"
+    _attr_icon = "mdi:cash-check"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = UnitOfCurrency.EURO
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the total savings sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_total_savings"
+
+    @property
+    def native_value(self) -> float:
+        """Return cumulative avoided EPEX cost less stored-energy cost."""
+        return self.coordinator.data.account.total_saved_cost_eur

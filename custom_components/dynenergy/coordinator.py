@@ -11,10 +11,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BATTERY_CHARGED_ENERGY_ENTITY,
+    CONF_BATTERY_DISCHARGED_ENERGY_ENTITY,
     CONF_BATTERY_POWER_ENTITY,
     CONF_CAPACITY_ENTITY,
     CONF_GRID_IMPORT_ENERGY_ENTITY,
@@ -34,6 +37,7 @@ from .const import (
     PLAN_HOUR,
     PLAN_MINUTE,
 )
+from .accounting import BatteryCostAccount
 from .optimizer import (
     INTERVAL_HOURS,
     BatteryParameters,
@@ -53,12 +57,16 @@ class DynEnergyData:
     price_source_state: str | None
     current_soc_percent: float | None
     current_battery_power: float | None
+    battery_charged_energy_kwh: float | None
+    battery_discharged_energy_kwh: float | None
     usable_capacity_kwh: float | None
     max_charge_power_kw: float | None
     max_discharge_power_kw: float | None
     grid_import_energy_kwh: float | None
+    account: BatteryCostAccount
     plan: OptimizationPlan | None = None
     planning_error: str | None = None
+    monitoring_error: str | None = None
 
 
 class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
@@ -74,10 +82,18 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self.entry = entry
         self._unsub_plan: Callable[[], None] | None = None
         self._unsub_apply: Callable[[], None] | None = None
+        self._unsub_monitor: Callable[[], None] | None = None
         self._last_target_power_w: int | None = None
+        self._account = BatteryCostAccount()
+        self._account_store: Store[dict[str, object]] = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}.account"
+        )
 
     async def async_start(self) -> None:
         """Start daily planning and 15-minute charge target updates."""
+        self._account = BatteryCostAccount.from_dict(
+            await self._account_store.async_load()
+        )
         self._unsub_plan = async_track_time_change(
             self.hass,
             self._async_create_next_day_plan,
@@ -91,6 +107,13 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             minute=range(0, 60, 15),
             second=0,
         )
+        self._unsub_monitor = async_track_time_change(
+            self.hass,
+            self._async_monitor_battery_energy,
+            minute=range(60),
+            second=0,
+        )
+        await self._async_monitor_battery_energy(dt_util.now())
         await self._async_apply_scheduled_power(dt_util.now())
 
     async def async_shutdown(self) -> None:
@@ -99,13 +122,16 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             self._unsub_plan()
         if self._unsub_apply:
             self._unsub_apply()
+        if self._unsub_monitor:
+            self._unsub_monitor()
         await self._async_set_battery_power_target(0)
 
     async def _async_update_data(self) -> DynEnergyData:
         """Read configured source entities without generating a new plan."""
         current_plan = self.data.plan if self.data else None
         planning_error = self.data.planning_error if self.data else None
-        return self._read_data(current_plan, planning_error)
+        monitoring_error = self.data.monitoring_error if self.data else None
+        return self._read_data(current_plan, planning_error, monitoring_error)
 
     async def _async_create_next_day_plan(self, now: datetime) -> None:
         """Refresh EPEX data and generate tomorrow's plan at 23:50 local time."""
@@ -121,10 +147,20 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             plan = self._create_charge_plan(data, target_date)
         except (HomeAssistantError, KeyError, TypeError, ValueError) as err:
             LOGGER.warning("Unable to create DynEnergy plan for %s: %s", target_date, err)
-            self.async_set_updated_data(self._read_data(planning_error=str(err)))
+            self.async_set_updated_data(
+                self._read_data(
+                    planning_error=str(err),
+                    monitoring_error=self.data.monitoring_error if self.data else None,
+                )
+            )
             return
 
-        self.async_set_updated_data(self._read_data(plan=plan))
+        self.async_set_updated_data(
+            self._read_data(
+                plan=plan,
+                monitoring_error=self.data.monitoring_error if self.data else None,
+            )
+        )
 
     async def _async_apply_scheduled_power(self, now: datetime) -> None:
         """Set the signed Watt helper for the current 15-minute plan interval."""
@@ -140,6 +176,54 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                     break
 
         await self._async_set_battery_power_target(target_power_w)
+
+    async def _async_monitor_battery_energy(self, now: datetime) -> None:
+        """Account for battery meter deltas at the current EPEX price each minute."""
+        current_plan = self.data.plan if self.data else None
+        planning_error = self.data.planning_error if self.data else None
+        data = self._read_data(current_plan, planning_error)
+        try:
+            if (
+                data.battery_charged_energy_kwh is None
+                or data.battery_discharged_energy_kwh is None
+            ):
+                raise ValueError("Missing cumulative battery charged or discharged energy")
+
+            if not self._account.initialized:
+                if data.current_soc_percent is None or data.usable_capacity_kwh is None:
+                    raise ValueError("Missing SOC or usable capacity for accounting baseline")
+                self._account = self._account.initialize(
+                    data.battery_charged_energy_kwh,
+                    data.battery_discharged_energy_kwh,
+                    data.usable_capacity_kwh * data.current_soc_percent / 100,
+                )
+            elif self._account.has_positive_meter_delta(
+                data.battery_charged_energy_kwh, data.battery_discharged_energy_kwh
+            ):
+                self._account = self._account.record(
+                    data.battery_charged_energy_kwh,
+                    data.battery_discharged_energy_kwh,
+                    self._current_price_per_kwh(now),
+                    float(self.entry.data[CONF_CHARGE_EFFICIENCY]),
+                    float(self.entry.data[CONF_DISCHARGE_EFFICIENCY]),
+                )
+            else:
+                self._account = self._account.record(
+                    data.battery_charged_energy_kwh,
+                    data.battery_discharged_energy_kwh,
+                    0.0,
+                    float(self.entry.data[CONF_CHARGE_EFFICIENCY]),
+                    float(self.entry.data[CONF_DISCHARGE_EFFICIENCY]),
+                )
+        except (KeyError, TypeError, ValueError) as err:
+            LOGGER.warning("Unable to update DynEnergy battery accounting: %s", err)
+            self.async_set_updated_data(
+                self._read_data(current_plan, planning_error, str(err))
+            )
+            return
+
+        await self._account_store.async_save(self._account.as_dict())
+        self.async_set_updated_data(self._read_data(current_plan, planning_error))
 
     async def _async_set_battery_power_target(self, target_power_w: int) -> None:
         """Write a changed signed power target to the configured input_number helper."""
@@ -163,6 +247,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self,
         plan: OptimizationPlan | None = None,
         planning_error: str | None = None,
+        monitoring_error: str | None = None,
     ) -> DynEnergyData:
         """Read the latest configured input states."""
         price_state = self.hass.states.get(self.entry.data[CONF_PRICE_ENTITY])
@@ -171,14 +256,22 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             price_source_state=price_state.state if price_state else None,
             current_soc_percent=self._numeric_state(CONF_SOC_ENTITY),
             current_battery_power=self._numeric_state(CONF_BATTERY_POWER_ENTITY),
+            battery_charged_energy_kwh=self._numeric_state(
+                CONF_BATTERY_CHARGED_ENERGY_ENTITY
+            ),
+            battery_discharged_energy_kwh=self._numeric_state(
+                CONF_BATTERY_DISCHARGED_ENERGY_ENTITY
+            ),
             usable_capacity_kwh=self._numeric_state(CONF_CAPACITY_ENTITY),
             max_charge_power_kw=self._numeric_state(CONF_MAX_CHARGE_POWER_ENTITY),
             max_discharge_power_kw=self._numeric_state(
                 CONF_MAX_DISCHARGE_POWER_ENTITY
             ),
             grid_import_energy_kwh=self._numeric_state(CONF_GRID_IMPORT_ENERGY_ENTITY),
+            account=self._account,
             plan=plan,
             planning_error=planning_error,
+            monitoring_error=monitoring_error,
         )
 
     def _create_charge_plan(
@@ -271,9 +364,40 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             [price_per_kwh for _, price_per_kwh in intervals],
         )
 
+    def _current_price_per_kwh(self, now: datetime) -> float:
+        """Return the EPEX price interval containing the supplied local time."""
+        price_state = self.hass.states.get(self.entry.data[CONF_PRICE_ENTITY])
+        raw_data = price_state.attributes.get("data") if price_state else None
+        if not isinstance(raw_data, Sequence) or isinstance(raw_data, str):
+            raise ValueError("EPEX price entity must provide a data attribute")
+
+        local_now = dt_util.as_local(now)
+        for raw_interval in raw_data:
+            if not isinstance(raw_interval, Mapping):
+                continue
+            try:
+                start = dt_util.as_local(
+                    datetime.fromisoformat(
+                        str(raw_interval["start_time"]).replace("Z", "+00:00")
+                    )
+                )
+                end = dt_util.as_local(
+                    datetime.fromisoformat(
+                        str(raw_interval["end_time"]).replace("Z", "+00:00")
+                    )
+                )
+                price_per_kwh = float(raw_interval["price_per_kwh"])
+            except (KeyError, TypeError, ValueError) as err:
+                raise ValueError("EPEX data has an invalid price interval") from err
+            if start <= local_now < end:
+                return price_per_kwh
+
+        raise ValueError("No EPEX price available for the current interval")
+
     def _numeric_state(self, config_key: str) -> float | None:
         """Read a configured numeric helper or sensor state."""
-        state = self.hass.states.get(self.entry.data[config_key])
+        entity_id = self.entry.data.get(config_key)
+        state = self.hass.states.get(entity_id) if entity_id else None
         try:
             return float(state.state) if state else None
         except ValueError:
