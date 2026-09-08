@@ -7,7 +7,6 @@ from datetime import timedelta
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfCurrency
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -134,7 +133,7 @@ class DynEnergyTotalChargingCostSensor(
     _attr_name = "Total costs"
     _attr_icon = "mdi:cash-plus"
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = UnitOfCurrency.EURO
+    _attr_native_unit_of_measurement = "EUR"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
@@ -157,7 +156,7 @@ class DynEnergyTotalSavedCostSensor(
     _attr_name = "Total savings"
     _attr_icon = "mdi:cash-check"
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = UnitOfCurrency.EURO
+    _attr_native_unit_of_measurement = "EUR"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
