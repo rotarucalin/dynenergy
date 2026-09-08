@@ -62,7 +62,7 @@ class DynEnergyData:
 
 
 class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
-    """Create daily charge plans and apply them through an input_number helper."""
+    """Create daily battery plans and apply them through an input_number helper."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
@@ -99,7 +99,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             self._unsub_plan()
         if self._unsub_apply:
             self._unsub_apply()
-        await self._async_set_charge_target(0)
+        await self._async_set_battery_power_target(0)
 
     async def _async_update_data(self) -> DynEnergyData:
         """Read configured source entities without generating a new plan."""
@@ -139,10 +139,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                     target_power_w = int(interval.target_battery_power_kw * 1000)
                     break
 
-        await self._async_set_charge_target(target_power_w)
+        await self._async_set_battery_power_target(target_power_w)
 
-    async def _async_set_charge_target(self, target_power_w: int) -> None:
-        """Write a changed charging target to the configured input_number helper."""
+    async def _async_set_battery_power_target(self, target_power_w: int) -> None:
+        """Write a changed signed power target to the configured input_number helper."""
         target_entity = self.entry.data.get(CONF_CHARGE_POWER_TARGET_ENTITY)
         if not target_entity or target_power_w == self._last_target_power_w:
             return
@@ -155,7 +155,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 blocking=True,
             )
         except HomeAssistantError as err:
-            LOGGER.error("Unable to set DynEnergy charge target: %s", err)
+            LOGGER.error("Unable to set DynEnergy battery power target: %s", err)
             return
         self._last_target_power_w = target_power_w
 

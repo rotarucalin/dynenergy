@@ -13,7 +13,7 @@
           "max_charge_power_entity": "Maximum charging power entity (kW)",
           "max_discharge_power_entity": "Maximum discharging power entity (kW)",
           "grid_import_energy_entity": "Cumulative grid import energy entity (kWh)",
-          "charge_power_target_entity": "Writable input_number for charge power (W; negative charges, 0 is idle)",
+          "charge_power_target_entity": "Writable input_number for battery power (W; negative charges, positive discharges, 0 is idle)",
           "charge_price_threshold": "Charge only below this price (EUR/kWh)",
           "min_soc_percent": "Minimum state of charge (%)",
           "max_soc_percent": "Maximum state of charge (%)",
