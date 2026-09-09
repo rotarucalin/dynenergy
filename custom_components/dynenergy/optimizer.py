@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Sequence
 
 INTERVAL_HOURS = 0.25
+INTERVALS_PER_HOUR = int(1 / INTERVAL_HOURS)
 ACTIVE_CONSUMPTION_KWH = 0.8 * INTERVAL_HOURS
 IDLE_CONSUMPTION_KWH = 0.06 * INTERVAL_HOURS
 MAX_CHARGE_PRICE_PER_KWH = 0.10
@@ -94,7 +95,14 @@ class OptimizationPlan:
 
 def target_power_w(interval: PlanInterval) -> int:
     """Return the signed Watt recommendation written to the battery helper."""
-    return int(interval.target_battery_power_kw * 4 * 1000)
+    return int(interval.target_battery_power_kw * INTERVALS_PER_HOUR * 1000)
+
+
+def interval_power_limit_kw(hourly_power_limit_kw: float | None) -> float | None:
+    """Scale an hourly power-limit setting to one optimizer interval."""
+    if hourly_power_limit_kw is None:
+        return None
+    return hourly_power_limit_kw / INTERVALS_PER_HOUR
 
 
 def default_consumption_kwh(timestamp: datetime) -> float:

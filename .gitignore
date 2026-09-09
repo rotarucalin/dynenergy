@@ -1,5 +1,4 @@
 README.md
-tests/
 .venv/
 .pytest_cache/
 .mypy_cache/

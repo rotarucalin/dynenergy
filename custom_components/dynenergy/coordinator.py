@@ -51,6 +51,7 @@ from .optimizer import (
     OptimizerInputs,
     create_greedy_charge_plan,
     default_consumption_kwh,
+    interval_power_limit_kw,
     target_power_w,
 )
 
@@ -314,11 +315,15 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             usable_capacity_kwh=self._numeric_state(
                 CONF_CAPACITY_ENTITY, _ENERGY_SCALE_TO_KWH
             ),
-            max_charge_power_kw=self._numeric_state(
-                CONF_MAX_CHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
+            max_charge_power_kw=interval_power_limit_kw(
+                self._numeric_state(
+                    CONF_MAX_CHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
+                )
             ),
-            max_discharge_power_kw=self._numeric_state(
-                CONF_MAX_DISCHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
+            max_discharge_power_kw=interval_power_limit_kw(
+                self._numeric_state(
+                    CONF_MAX_DISCHARGE_POWER_ENTITY, _POWER_SCALE_TO_KW
+                )
             ),
             grid_import_energy_kwh=self._numeric_state(
                 CONF_GRID_IMPORT_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
