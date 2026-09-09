@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, time
 from enum import StrEnum
@@ -9,7 +10,10 @@ from typing import Sequence
 
 INTERVAL_HOURS = 0.25
 INTERVALS_PER_HOUR = int(1 / INTERVAL_HOURS)
-ACTIVE_CONSUMPTION_KWH = 0.8 * INTERVAL_HOURS
+INTERVAL_MINUTES = int(INTERVAL_HOURS * 60)
+INTERVALS_PER_DAY = 24 * INTERVALS_PER_HOUR
+INTERVALS_PER_WEEK = 7 * INTERVALS_PER_DAY
+ACTIVE_CONSUMPTION_KWH = 1.25 * INTERVAL_HOURS
 IDLE_CONSUMPTION_KWH = 0.06 * INTERVAL_HOURS
 MAX_CHARGE_PRICE_PER_KWH = 0.10
 MIN_DISCHARGE_PRICE_PER_KWH = 0.13
@@ -93,6 +97,82 @@ class OptimizationPlan:
     summary: PlanSummary
 
 
+@dataclass(frozen=True, slots=True)
+class WeeklyConsumptionProfile:
+    """Learned consumption averages for every 15-minute slot of a week."""
+
+    values_kwh: tuple[float, ...]
+    sample_counts: tuple[int, ...]
+
+    @classmethod
+    def default(cls) -> WeeklyConsumptionProfile:
+        """Create the initial weekday profile before real samples are available."""
+        values = tuple(
+            _default_consumption_for_slot(weekday, slot)
+            for weekday in range(7)
+            for slot in range(INTERVALS_PER_DAY)
+        )
+        return cls(values, (0,) * INTERVALS_PER_WEEK)
+
+    @classmethod
+    def from_dict(
+        cls, data: Mapping[str, object] | None
+    ) -> WeeklyConsumptionProfile:
+        """Restore a profile, falling back to defaults for invalid payloads."""
+        if not data:
+            return cls.default()
+        raw_values = data.get("values_kwh")
+        raw_counts = data.get("sample_counts")
+        if not isinstance(raw_values, list) or not isinstance(raw_counts, list):
+            return cls.default()
+        if (
+            len(raw_values) != INTERVALS_PER_WEEK
+            or len(raw_counts) != INTERVALS_PER_WEEK
+        ):
+            return cls.default()
+        try:
+            values = tuple(max(0.0, float(value)) for value in raw_values)
+            counts = tuple(max(0, int(count)) for count in raw_counts)
+        except (TypeError, ValueError):
+            return cls.default()
+        return cls(values, counts)
+
+    def as_dict(self) -> dict[str, list[float] | list[int]]:
+        """Serialize the learned profile for Home Assistant storage."""
+        return {
+            "values_kwh": list(self.values_kwh),
+            "sample_counts": list(self.sample_counts),
+        }
+
+    def consumption_kwh(self, timestamp: datetime) -> float:
+        """Return typical energy consumption for the timestamp's weekly slot."""
+        return self.values_kwh[weekly_slot_index(timestamp)]
+
+    def record(
+        self, timestamp: datetime, consumption_kwh: float
+    ) -> WeeklyConsumptionProfile:
+        """Return a profile with one real sample added to a weekly slot."""
+        index = weekly_slot_index(timestamp)
+        sample_count = self.sample_counts[index]
+        average_kwh = self.values_kwh[index]
+        updated_average_kwh = (
+            average_kwh * sample_count + max(0.0, consumption_kwh)
+        ) / (sample_count + 1)
+        values = list(self.values_kwh)
+        counts = list(self.sample_counts)
+        values[index] = updated_average_kwh
+        counts[index] = sample_count + 1
+        return WeeklyConsumptionProfile(tuple(values), tuple(counts))
+
+
+def weekly_slot_index(timestamp: datetime) -> int:
+    """Return the fixed weekly slot index for a local timestamp."""
+    slot_of_day = timestamp.hour * INTERVALS_PER_HOUR + (
+        timestamp.minute // INTERVAL_MINUTES
+    )
+    return timestamp.weekday() * INTERVALS_PER_DAY + slot_of_day
+
+
 def target_power_w(interval: PlanInterval) -> int:
     """Return the signed Watt recommendation written to the battery helper."""
     return int(interval.target_battery_power_kw * INTERVALS_PER_HOUR * 1000)
@@ -107,12 +187,21 @@ def interval_power_limit_kw(hourly_power_limit_kw: float | None) -> float | None
 
 def default_consumption_kwh(timestamp: datetime) -> float:
     """Return the default weekday consumption profile for one interval."""
-    weekday = timestamp.weekday()
-    interval_time = timestamp.time()
+    slot = timestamp.hour * INTERVALS_PER_HOUR + (
+        timestamp.minute // INTERVAL_MINUTES
+    )
+    return _default_consumption_for_slot(timestamp.weekday(), slot)
 
+
+def _default_consumption_for_slot(weekday: int, slot: int) -> float:
+    """Return the seeded energy consumption for one weekday and slot."""
+    interval_time = time(
+        slot // INTERVALS_PER_HOUR,
+        slot % INTERVALS_PER_HOUR * INTERVAL_MINUTES,
+    )
     if weekday < 4 and time(7, 45) <= interval_time < time(18, 30):
         return ACTIVE_CONSUMPTION_KWH
-    if weekday == 4 and time(7, 45) <= interval_time < time(13, 0):
+    if weekday == 4 and time(7, 45) <= interval_time < time(13, 30):
         return ACTIVE_CONSUMPTION_KWH
     return IDLE_CONSUMPTION_KWH
 

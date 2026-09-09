@@ -16,7 +16,22 @@ from homeassistant.const import UnitOfPower
 
 from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, DOMAIN
 from .coordinator import DynEnergyCoordinator
-from .optimizer import INTERVAL_HOURS, PlanInterval, target_power_w
+from .optimizer import (
+    INTERVAL_HOURS,
+    INTERVALS_PER_DAY,
+    PlanInterval,
+    target_power_w,
+)
+
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
 
 
 async def async_setup_entry(
@@ -30,6 +45,7 @@ async def async_setup_entry(
         [
             DynEnergyPlanSensor(coordinator, entry),
             DynEnergyPowerRecommendationSensor(coordinator, entry),
+            DynEnergyTypicalConsumptionSensor(coordinator, entry),
             DynEnergyStoredEnergyCostSensor(coordinator, entry),
             DynEnergyTotalChargingCostSensor(coordinator, entry),
             DynEnergyTotalSavedCostSensor(coordinator, entry),
@@ -172,6 +188,53 @@ class DynEnergyPowerRecommendationSensor(
         }
 
 
+class DynEnergyTypicalConsumptionSensor(
+    CoordinatorEntity[DynEnergyCoordinator], SensorEntity
+):
+    """Expose the learned typical consumption for the current weekly slot."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Typical consumption"
+    _attr_icon = "mdi:chart-timeline-variant"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"weekly_profile_w", "sample_counts"})
+
+    def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the typical-consumption sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_typical_consumption"
+
+    @property
+    def native_value(self) -> int:
+        """Return the current slot's typical average power in Watts."""
+        consumption_kwh = self.coordinator.data.consumption_profile.consumption_kwh(
+            dt_util.now()
+        )
+        return round(consumption_kwh / INTERVAL_HOURS * 1000)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose all 672 weekly consumption averages and sample counts."""
+        profile = self.coordinator.data.consumption_profile
+        weekly_profile_w: dict[str, list[int]] = {}
+        sample_counts: dict[str, list[int]] = {}
+        for weekday, name in enumerate(_WEEKDAYS):
+            start = weekday * INTERVALS_PER_DAY
+            end = start + INTERVALS_PER_DAY
+            weekly_profile_w[name] = [
+                round(value / INTERVAL_HOURS * 1000)
+                for value in profile.values_kwh[start:end]
+            ]
+            sample_counts[name] = list(profile.sample_counts[start:end])
+        return {
+            "interval_minutes": int(INTERVAL_HOURS * 60),
+            "weekly_profile_w": weekly_profile_w,
+            "sample_counts": sample_counts,
+        }
+
+
 class DynEnergyStoredEnergyCostSensor(
     CoordinatorEntity[DynEnergyCoordinator], SensorEntity
 ):
@@ -197,7 +260,7 @@ class DynEnergyStoredEnergyCostSensor(
 class DynEnergyTotalChargingCostSensor(
     CoordinatorEntity[DynEnergyCoordinator], SensorEntity
 ):
-    """Expose cumulative EPEX costs paid to charge the battery."""
+    """Expose cumulative EPEX costs of measured battery consumption."""
 
     _attr_has_entity_name = True
     _attr_name = "Total costs"
@@ -213,14 +276,14 @@ class DynEnergyTotalChargingCostSensor(
 
     @property
     def native_value(self) -> float:
-        """Return cumulative charging costs in euros."""
+        """Return cumulative measured charging costs in euros."""
         return self.coordinator.data.account.total_charging_cost_eur
 
 
 class DynEnergyTotalSavedCostSensor(
     CoordinatorEntity[DynEnergyCoordinator], SensorEntity
 ):
-    """Expose cumulative EPEX savings from battery discharge."""
+    """Expose cumulative EPEX value of measured battery generation."""
 
     _attr_has_entity_name = True
     _attr_name = "Total savings"
@@ -236,5 +299,5 @@ class DynEnergyTotalSavedCostSensor(
 
     @property
     def native_value(self) -> float:
-        """Return cumulative avoided EPEX cost less stored-energy cost."""
+        """Return cumulative measured discharge savings."""
         return self.coordinator.data.account.total_saved_cost_eur

@@ -3,8 +3,13 @@
 from datetime import UTC, datetime
 
 from custom_components.dynenergy.optimizer import (
+    ACTIVE_CONSUMPTION_KWH,
+    IDLE_CONSUMPTION_KWH,
+    INTERVALS_PER_WEEK,
     OperatingState,
     PlanInterval,
+    WeeklyConsumptionProfile,
+    default_consumption_kwh,
     interval_power_limit_kw,
     target_power_w,
 )
@@ -44,3 +49,55 @@ def test_target_power_preserves_charge_sign() -> None:
 def test_missing_power_limit_remains_missing() -> None:
     """An unavailable configured limit is not converted into a numeric value."""
     assert interval_power_limit_kw(None) is None
+
+
+def test_default_weekly_consumption_profile() -> None:
+    """The initial profile uses the requested weekday working hours."""
+    monday = datetime(2026, 9, 7, tzinfo=UTC)
+    friday = datetime(2026, 9, 11, tzinfo=UTC)
+    saturday = datetime(2026, 9, 12, tzinfo=UTC)
+
+    assert (
+        default_consumption_kwh(monday.replace(hour=7, minute=30))
+        == IDLE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(monday.replace(hour=7, minute=45))
+        == ACTIVE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(monday.replace(hour=18, minute=15))
+        == ACTIVE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(monday.replace(hour=18, minute=30))
+        == IDLE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(friday.replace(hour=13, minute=15))
+        == ACTIVE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(friday.replace(hour=13, minute=30))
+        == IDLE_CONSUMPTION_KWH
+    )
+    assert (
+        default_consumption_kwh(saturday.replace(hour=10))
+        == IDLE_CONSUMPTION_KWH
+    )
+
+
+def test_weekly_profile_learns_a_running_average() -> None:
+    """Real interval samples replace defaults and then form a running average."""
+    timestamp = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
+    profile = WeeklyConsumptionProfile.default()
+
+    assert len(profile.values_kwh) == INTERVALS_PER_WEEK
+    assert profile.consumption_kwh(timestamp) == ACTIVE_CONSUMPTION_KWH
+
+    profile = profile.record(timestamp, 0.5)
+    assert profile.consumption_kwh(timestamp) == 0.5
+
+    profile = profile.record(timestamp, 0.25)
+    assert profile.consumption_kwh(timestamp) == 0.375
+    assert WeeklyConsumptionProfile.from_dict(profile.as_dict()) == profile

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 _EPSILON = 1e-9
+_ACCOUNTING_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +31,7 @@ class BatteryCostAccount:
     @classmethod
     def from_dict(cls, data: Mapping[str, object] | None) -> BatteryCostAccount:
         """Restore an account, tolerating a missing or older stored payload."""
-        if not data:
+        if not data or data.get("accounting_version") != _ACCOUNTING_VERSION:
             return cls()
 
         def number(key: str, default: float = 0.0) -> float:
@@ -57,9 +58,10 @@ class BatteryCostAccount:
             initialized=bool(data.get("initialized", False)),
         )
 
-    def as_dict(self) -> dict[str, float | bool | None]:
+    def as_dict(self) -> dict[str, float | int | bool | None]:
         """Serialize the account for Home Assistant storage."""
         return {
+            "accounting_version": _ACCOUNTING_VERSION,
             "stored_energy_kwh": self.stored_energy_kwh,
             "stored_energy_cost_eur": self.stored_energy_cost_eur,
             "total_charging_cost_eur": self.total_charging_cost_eur,
@@ -102,10 +104,8 @@ class BatteryCostAccount:
         charged_energy_kwh: float,
         discharged_energy_kwh: float,
         price_per_kwh: float,
-        charge_efficiency: float,
-        discharge_efficiency: float,
     ) -> BatteryCostAccount:
-        """Apply meter deltas at the current EPEX price to the cost ledger."""
+        """Apply real charged and discharged meter deltas to the cost ledger."""
         if not self.initialized:
             raise ValueError("Battery cost account must be initialized first")
 
@@ -121,10 +121,13 @@ class BatteryCostAccount:
         total_saved_cost_eur = self.total_saved_cost_eur
 
         if charge_delta_kwh > _EPSILON:
-            charge_cost_eur = charge_delta_kwh / charge_efficiency * price_per_kwh
+            charge_cost_eur = charge_delta_kwh * price_per_kwh
             stored_energy_kwh += charge_delta_kwh
             stored_energy_cost_eur += charge_cost_eur
             total_charging_cost_eur += charge_cost_eur
+
+        if discharge_delta_kwh > _EPSILON:
+            total_saved_cost_eur += discharge_delta_kwh * price_per_kwh
 
         discharged_stored_energy_kwh = min(discharge_delta_kwh, stored_energy_kwh)
         if discharged_stored_energy_kwh > _EPSILON:
@@ -133,14 +136,8 @@ class BatteryCostAccount:
                 * stored_energy_cost_eur
                 / stored_energy_kwh
             )
-            avoided_grid_cost_eur = (
-                discharged_stored_energy_kwh
-                * discharge_efficiency
-                * price_per_kwh
-            )
             stored_energy_kwh -= discharged_stored_energy_kwh
             stored_energy_cost_eur -= cost_basis_eur
-            total_saved_cost_eur += avoided_grid_cost_eur - cost_basis_eur
 
         return BatteryCostAccount(
             stored_energy_kwh=max(0.0, stored_energy_kwh),

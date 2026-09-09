@@ -46,11 +46,12 @@ from .const import (
 from .accounting import BatteryCostAccount
 from .optimizer import (
     INTERVAL_HOURS,
+    INTERVAL_MINUTES,
     BatteryParameters,
     OptimizationPlan,
     OptimizerInputs,
+    WeeklyConsumptionProfile,
     create_greedy_charge_plan,
-    default_consumption_kwh,
     interval_power_limit_kw,
     target_power_w,
 )
@@ -85,6 +86,7 @@ class DynEnergyData:
     max_discharge_power_kw: float | None
     grid_import_energy_kwh: float | None
     account: BatteryCostAccount
+    consumption_profile: WeeklyConsumptionProfile
     plan: OptimizationPlan | None = None
     planning_error: str | None = None
     monitoring_error: str | None = None
@@ -110,11 +112,20 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self._account_store: Store[dict[str, object]] = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.account"
         )
+        self._consumption_profile = WeeklyConsumptionProfile.default()
+        self._consumption_profile_store: Store[dict[str, object]] = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}.consumption_profile"
+        )
+        self._previous_grid_import_kwh: float | None = None
+        self._previous_grid_import_at: datetime | None = None
 
     async def async_start(self) -> None:
         """Start daily planning and 15-minute charge target updates."""
         self._account = BatteryCostAccount.from_dict(
             await self._account_store.async_load()
+        )
+        self._consumption_profile = WeeklyConsumptionProfile.from_dict(
+            await self._consumption_profile_store.async_load()
         )
         self._unsub_plan = async_track_time_change(
             self.hass,
@@ -125,7 +136,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         )
         self._unsub_apply = async_track_time_change(
             self.hass,
-            self._async_apply_scheduled_power,
+            self._async_run_interval_tasks,
             minute=range(0, 60, 15),
             second=0,
         )
@@ -135,9 +146,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             minute=range(60),
             second=0,
         )
-        await self._async_monitor_battery_energy(dt_util.now())
+        now = dt_util.now()
+        self._start_consumption_tracking(now)
+        await self._async_monitor_battery_energy(now)
         await self._async_restore_plan()
-        await self._async_apply_scheduled_power(dt_util.now())
+        await self._async_apply_scheduled_power(now)
 
     async def async_shutdown(self) -> None:
         """Stop scheduled callbacks and leave the charge target idle."""
@@ -152,6 +165,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             await self._account_store.async_save(self._account.as_dict())
             self._account_dirty = False
         await super().async_shutdown()
+
+    async def _async_run_interval_tasks(self, now: datetime) -> None:
+        """Learn the completed interval and apply the next battery target."""
+        await self._async_update_consumption_profile(now)
+        await self._async_apply_scheduled_power(now)
 
     async def _async_update_data(self) -> DynEnergyData:
         """Read configured source entities without generating a new plan."""
@@ -243,16 +261,12 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
                     self._current_price_per_kwh(now),
-                    float(self.entry.data[CONF_CHARGE_EFFICIENCY]),
-                    float(self.entry.data[CONF_DISCHARGE_EFFICIENCY]),
                 )
             else:
                 self._account = self._account.record(
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
                     0.0,
-                    float(self.entry.data[CONF_CHARGE_EFFICIENCY]),
-                    float(self.entry.data[CONF_DISCHARGE_EFFICIENCY]),
                 )
         except (KeyError, TypeError, ValueError) as err:
             LOGGER.warning("Unable to update DynEnergy battery accounting: %s", err)
@@ -270,6 +284,53 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             await self._account_store.async_save(self._account.as_dict())
             self._account_dirty = False
         self.async_set_updated_data(self._read_data(current_plan, planning_error))
+
+    def _start_consumption_tracking(self, now: datetime) -> None:
+        """Capture a grid-import baseline without learning a partial interval."""
+        self._previous_grid_import_kwh = self._numeric_state(
+            CONF_GRID_IMPORT_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
+        )
+        self._previous_grid_import_at = dt_util.as_local(now)
+
+    async def _async_update_consumption_profile(self, now: datetime) -> None:
+        """Add the completed 15-minute grid-import sample to its weekly slot."""
+        local_now = dt_util.as_local(now)
+        grid_import_kwh = self._numeric_state(
+            CONF_GRID_IMPORT_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
+        )
+        previous_kwh = self._previous_grid_import_kwh
+        previous_at = self._previous_grid_import_at
+        is_full_interval = (
+            previous_at is not None
+            and previous_at.second == 0
+            and previous_at.microsecond == 0
+            and previous_at.minute % INTERVAL_MINUTES == 0
+            and local_now.timestamp() - previous_at.timestamp()
+            == INTERVAL_MINUTES * 60
+        )
+
+        if (
+            grid_import_kwh is not None
+            and previous_kwh is not None
+            and previous_at is not None
+            and grid_import_kwh >= previous_kwh
+            and is_full_interval
+        ):
+            self._consumption_profile = self._consumption_profile.record(
+                previous_at, grid_import_kwh - previous_kwh
+            )
+            await self._consumption_profile_store.async_save(
+                self._consumption_profile.as_dict()
+            )
+
+        self._previous_grid_import_kwh = grid_import_kwh
+        self._previous_grid_import_at = local_now
+        current_plan = self.data.plan if self.data else None
+        planning_error = self.data.planning_error if self.data else None
+        monitoring_error = self.data.monitoring_error if self.data else None
+        self.async_set_updated_data(
+            self._read_data(current_plan, planning_error, monitoring_error)
+        )
 
     async def _async_set_battery_power_target(self, target_power_w: int) -> None:
         """Write a changed signed power target to the configured input_number helper."""
@@ -329,6 +390,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 CONF_GRID_IMPORT_ENERGY_ENTITY, _ENERGY_SCALE_TO_KWH
             ),
             account=self._account,
+            consumption_profile=self._consumption_profile,
             plan=plan,
             planning_error=planning_error,
             monitoring_error=monitoring_error,
@@ -367,7 +429,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         inputs = OptimizerInputs(
             timestamps=timestamps,
             prices_per_kwh=prices_per_kwh,
-            consumption_kwh=[default_consumption_kwh(timestamp) for timestamp in timestamps],
+            consumption_kwh=[
+                self._consumption_profile.consumption_kwh(timestamp)
+                for timestamp in timestamps
+            ],
             current_soc_percent=data.current_soc_percent,
             battery=battery,
         )

@@ -22,6 +22,8 @@ realized EPEX savings when that energy is discharged.
   to the highest-priced eligible household demand slots.
 - Monitors cumulative battery charged/discharged energy every minute and
   publishes the cost of stored energy, total charging costs, and total savings.
+- Learns a persistent 672-slot weekly consumption profile from the cumulative
+  grid-import meter and exposes it through the Typical consumption sensor.
 - Persists accounting data and meter baselines across Home Assistant restarts.
 
 ## Requirements
@@ -80,7 +82,7 @@ select the cumulative battery charged and discharged energy sensors.
 | Usable battery capacity entity | kWh | Usable, not nameplate, capacity. |
 | Maximum charging power entity | kW | Physical charge limit. |
 | Maximum discharging power entity | kW | Physical discharge limit. |
-| Cumulative grid-import energy entity | kWh total | Reserved for future consumption learning; the current release uses its fixed profile. |
+| Cumulative grid-import energy entity | kWh total | Used every 15 minutes to learn the typical weekly consumption profile. |
 | Writable battery power helper | `input_number`, W | Negative charge, positive discharge, zero idle. |
 | Charge price threshold | EUR/kWh | Additional user cap; defaults to `0.10`. |
 | Minimum / maximum SOC | Percent | Must be ordered and within 0-100. |
@@ -115,8 +117,12 @@ the battery in the cheapest slots strictly below $T_{charge}$. After the final
 charge slot, it may discharge any available energy above minimum SOC into later
 demand at or above $T_{post}$; the battery does not need to reach maximum SOC.
 
-The built-in demand profile is 0.2 kWh per 15 minutes from Monday to Thursday,
-07:45-18:30, and Friday, 07:45-13:00. All other intervals use 0.015 kWh.
+The initial demand profile is 0.3125 kWh (an average 1.25 kW) per 15 minutes
+from Monday to Thursday, 07:45-18:30, and Friday, 07:45-13:30. All other
+intervals use 0.015 kWh (an average 60 W). DynEnergy keeps one running average
+for each of the 672 quarter-hour slots in a week. At every quarter-hour boundary
+it adds the completed interval's grid-import delta to the corresponding average
+and persists the profile. New plans use the learned values.
 
 ## Entities
 
@@ -125,30 +131,36 @@ DynEnergy creates these sensors:
 | Entity name | Unit | Meaning |
 |---|---|---|
 | Battery plan | EUR | Expected daily EPEX saving from the current day-ahead plan. Its attributes contain the full schedule, plan summary, source readings, and status. |
+| Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
+| Typical consumption | W | Learned average for the current weekly slot. Its attributes contain all 672 weekly averages and their sample counts. |
 | Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. |
-| Total costs | EUR | Cumulative EPEX cost paid to charge the battery since accounting began. |
-| Total savings | EUR | Cumulative avoided EPEX cost less the cost basis of discharged energy. |
+| Total costs | EUR | Cumulative EPEX value of actual measured battery charging. |
+| Total savings | EUR | Cumulative EPEX value of actual measured battery discharge. |
 
 ## Battery Cost Monitoring
 
 Every minute, DynEnergy compares the two configured cumulative battery-energy
-counters with their previous readings. For battery-side charged energy
-$\Delta E_c$, it adds this acquisition cost to the stored-energy ledger:
+counters with their previous readings. Actual charged consumption $\Delta E_c$
+updates `Total costs` by:
 
 $$
-\frac{\Delta E_c}{\eta_c}P_{EPEX}
+\Delta E_cP_{EPEX}
 $$
 
-For battery-side discharged energy $\Delta E_d$, it realizes this saving:
+Actual discharged generation $\Delta E_d$ updates `Total savings` by:
 
 $$
-\Delta E_d\eta_dP_{EPEX}-\Delta E_dC_{stored}
+\Delta E_dP_{EPEX}
 $$
 
 At first installation, the energy implied by current SOC and usable capacity is
 entered with a cost of EUR 0. The current energy-counter readings become the
-baseline, so previous charging and discharging never appears in `Total costs`
+baseline, so previous charging and discharging never appear in `Total costs`
 or `Total savings`. The ledger is saved across Home Assistant restarts.
+
+When upgrading from the earlier estimated accounting formula, the previous
+totals are reset because they cannot be corrected without historical meter
+readings.
 
 This accounting uses spot EPEX prices only. It does not include electricity
 taxes, network charges, VAT, fixed tariff components, export remuneration, or
@@ -193,8 +205,8 @@ disconnected from automatic control first.
 
 ## Current Limitations
 
-- The optimizer uses a fixed household consumption profile; it does not yet
-  learn from the configured grid-import energy counter.
+- The learned consumption profile uses grid import as the consumption signal;
+  behind-the-meter generation is not included in that profile.
 - Discharge only offsets modeled household demand. Export optimization is out of
   scope.
 - The plan is generated once daily and assumes the current SOC is the opening
