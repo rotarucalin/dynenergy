@@ -92,6 +92,11 @@ class OptimizationPlan:
     summary: PlanSummary
 
 
+def target_power_w(interval: PlanInterval) -> int:
+    """Return the signed Watt recommendation written to the battery helper."""
+    return int(interval.target_battery_power_kw * 4 * 1000)
+
+
 def default_consumption_kwh(timestamp: datetime) -> float:
     """Return the default weekday consumption profile for one interval."""
     weekday = timestamp.weekday()

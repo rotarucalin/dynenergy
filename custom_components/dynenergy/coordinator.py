@@ -51,6 +51,7 @@ from .optimizer import (
     OptimizerInputs,
     create_greedy_charge_plan,
     default_consumption_kwh,
+    target_power_w,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -200,7 +201,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def _async_apply_scheduled_power(self, now: datetime) -> None:
         """Set the signed Watt helper for the current 15-minute plan interval."""
-        target_power_w = 0
+        target_power = 0
         plan = self.data.plan if self.data else None
         if plan:
             local_now = dt_util.as_local(now)
@@ -208,10 +209,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 if interval.timestamp <= local_now < interval.timestamp + timedelta(
                     hours=INTERVAL_HOURS
                 ):
-                    target_power_w = int(interval.target_battery_power_kw * 4 * 1000)
+                    target_power = target_power_w(interval)
                     break
 
-        await self._async_set_battery_power_target(target_power_w)
+        await self._async_set_battery_power_target(target_power)
 
     async def _async_monitor_battery_energy(self, now: datetime) -> None:
         """Account for battery meter deltas at the current EPEX price each minute."""

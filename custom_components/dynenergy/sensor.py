@@ -12,9 +12,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from homeassistant.const import UnitOfPower
+
 from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, DOMAIN
 from .coordinator import DynEnergyCoordinator
-from .optimizer import INTERVAL_HOURS
+from .optimizer import INTERVAL_HOURS, PlanInterval, target_power_w
 
 
 async def async_setup_entry(
@@ -27,6 +29,7 @@ async def async_setup_entry(
     async_add_entities(
         [
             DynEnergyPlanSensor(coordinator, entry),
+            DynEnergyPowerRecommendationSensor(coordinator, entry),
             DynEnergyStoredEnergyCostSensor(coordinator, entry),
             DynEnergyTotalChargingCostSensor(coordinator, entry),
             DynEnergyTotalSavedCostSensor(coordinator, entry),
@@ -86,20 +89,87 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             local_now = dt_util.now()
             attributes["summary"] = asdict(data.plan.summary)
             attributes["intervals"] = [
-                {
-                    "timestamp": interval.timestamp.isoformat(),
-                    "price_per_kwh": interval.price_per_kwh,
-                    "consumption_kwh": interval.consumption_kwh,
-                    "target_battery_power_w": int(
-                        interval.target_battery_power_kw * 4 * 1000
-                    ),
-                    "expected_soc_percent": interval.expected_soc_percent,
-                    "state": interval.state.value,
-                }
+                _interval_as_dict(interval)
                 for interval in data.plan.intervals
                 if interval.timestamp + timedelta(hours=INTERVAL_HOURS) > local_now
             ]
         return attributes
+
+
+def _interval_as_dict(interval: PlanInterval) -> dict[str, object]:
+    """Render one plan interval for entity attributes."""
+    return {
+        "timestamp": interval.timestamp.isoformat(),
+        "price_per_kwh": interval.price_per_kwh,
+        "consumption_kwh": interval.consumption_kwh,
+        "target_battery_power_w": target_power_w(interval),
+        "expected_soc_percent": interval.expected_soc_percent,
+        "state": interval.state.value,
+    }
+
+
+class DynEnergyPowerRecommendationSensor(
+    CoordinatorEntity[DynEnergyCoordinator], SensorEntity
+):
+    """Expose the recommended battery power for the current and all plan intervals."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery power recommendation"
+    _attr_icon = "mdi:transmission-tower"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"intervals"})
+
+    def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the power recommendation sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_power_recommendation"
+
+    def _current_interval(self) -> PlanInterval | None:
+        """Return the plan interval containing the current local time."""
+        plan = self.coordinator.data.plan
+        if not plan:
+            return None
+        local_now = dt_util.now()
+        return next(
+            (
+                interval
+                for interval in plan.intervals
+                if interval.timestamp
+                <= local_now
+                < interval.timestamp + timedelta(hours=INTERVAL_HOURS)
+            ),
+            None,
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the signed Watt recommendation for the current interval."""
+        interval = self._current_interval()
+        if interval is None:
+            return None if self.coordinator.data.plan is None else 0
+        return target_power_w(interval)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Provide the recommendation for every interval of the active plan."""
+        plan = self.coordinator.data.plan
+        if not plan:
+            return {"intervals": []}
+        current = self._current_interval()
+        return {
+            "current_interval_start": (
+                current.timestamp.isoformat() if current else None
+            ),
+            "current_state": current.state.value if current else None,
+            "plan_start": plan.intervals[0].timestamp.isoformat(),
+            "plan_end": (
+                plan.intervals[-1].timestamp + timedelta(hours=INTERVAL_HOURS)
+            ).isoformat(),
+            "interval_minutes": int(INTERVAL_HOURS * 60),
+            "intervals": [_interval_as_dict(interval) for interval in plan.intervals],
+        }
 
 
 class DynEnergyStoredEnergyCostSensor(
