@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, time
 from enum import StrEnum
+from math import floor
 from typing import Sequence
 
 INTERVAL_HOURS = 0.25
@@ -20,6 +21,10 @@ MIN_DISCHARGE_PRICE_PER_KWH = 0.13
 CHARGE_PRICE_BAND = 0.25
 PRE_CHARGE_DISCHARGE_PRICE_BAND = 0.50
 POST_CHARGE_DISCHARGE_PRICE_BAND = 0.70
+CHARGE_PRICE_BUCKET_WIDTH = 0.01
+CHARGE_MARGIN_FRACTION = 0.20
+# Allocations below this are rounding residue, not a usable battery instruction.
+ENERGY_EPSILON_KWH = 1e-9
 
 
 class OperatingState(StrEnum):
@@ -87,6 +92,7 @@ class PlanSummary:
     cost_without_battery: float
     cost_with_battery: float
     daily_saving: float
+    full_charge_feasible: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,10 +245,12 @@ def create_greedy_charge_plan(
 ) -> OptimizationPlan:
     """Create a capacity-aware charge and discharge plan.
 
-    Existing energy is allocated to the highest-priced eligible demand before
-    charging begins. The battery is then charged in the cheapest sub-threshold
-    slots. Its available energy is allocated to the highest-priced eligible
-    demand after the final charge interval.
+    The horizon is split into contiguous blocks of sub-threshold prices and the
+    discharge gaps around them, then walked in chronological order so a day with
+    both a cheap night and a cheap midday runs two charge and discharge cycles.
+    Every gap is planned against the block that follows it: when that block can
+    refill the battery on its own, the gap may empty the battery down to its
+    minimum, otherwise stored energy is held back for higher prices.
     """
     _validate_charge_inputs(inputs, charge_price_threshold_per_kwh)
     thresholds = calculate_price_thresholds(
@@ -252,80 +260,271 @@ def create_greedy_charge_plan(
     battery = inputs.battery
     minimum_energy_kwh = battery.usable_capacity_kwh * battery.min_soc_percent / 100
     target_energy_kwh = battery.usable_capacity_kwh * battery.max_soc_percent / 100
-    initial_energy_kwh = battery.usable_capacity_kwh * inputs.current_soc_percent / 100
+    refill_needed_kwh = target_energy_kwh - minimum_energy_kwh
+    stored_energy_kwh = battery.usable_capacity_kwh * inputs.current_soc_percent / 100
     charge_energy_by_index = [0.0] * len(inputs.timestamps)
     discharge_energy_by_index = [0.0] * len(inputs.timestamps)
 
-    eligible_charge_indices = sorted(
-        (
-            index
-            for index, price in enumerate(inputs.prices_per_kwh)
-            if price < thresholds.charge_per_kwh
-        ),
-        key=lambda index: (inputs.prices_per_kwh[index], inputs.timestamps[index]),
-    )
-    first_charge_index = min(eligible_charge_indices, default=len(inputs.timestamps))
-    remaining_initial_energy_kwh = _allocate_discharge(
-        inputs,
-        discharge_energy_by_index,
-        available_energy_kwh=initial_energy_kwh - minimum_energy_kwh,
-        candidate_indices=range(first_charge_index),
-        minimum_price_per_kwh=thresholds.pre_charge_discharge_per_kwh,
-    ) + minimum_energy_kwh
-
-    remaining_energy_after_charge_kwh = _allocate_charge(
-        inputs,
-        charge_energy_by_index,
-        starting_energy_kwh=remaining_initial_energy_kwh,
-        target_energy_kwh=target_energy_kwh,
-        candidate_indices=eligible_charge_indices,
-    )
-    last_charge_index = max(
-        (index for index, energy in enumerate(charge_energy_by_index) if energy > 0),
-        default=-1,
-    )
-
-    # Without a charge interval the remaining energy was never bought cheaply,
-    # so it is released from the first charge candidate at the pre-charge threshold.
-    _allocate_discharge(
-        inputs,
-        discharge_energy_by_index,
-        available_energy_kwh=remaining_energy_after_charge_kwh - minimum_energy_kwh,
-        candidate_indices=range(
-            last_charge_index + 1 if last_charge_index >= 0 else first_charge_index,
-            len(inputs.timestamps),
-        ),
-        minimum_price_per_kwh=(
-            thresholds.post_charge_discharge_per_kwh
-            if last_charge_index >= 0
-            else thresholds.pre_charge_discharge_per_kwh
-        ),
-    )
-
-    intervals: list[PlanInterval] = []
-    expected_energy_kwh = initial_energy_kwh
-    for index, timestamp in enumerate(inputs.timestamps):
-        charge_energy_kwh = charge_energy_by_index[index]
-        discharge_energy_kwh = discharge_energy_by_index[index]
-        expected_energy_kwh += charge_energy_kwh * battery.charge_efficiency
-        expected_energy_kwh -= discharge_energy_kwh / battery.discharge_efficiency
-        target_power_kw = (
-            -charge_energy_kwh / INTERVAL_HOURS
-            if charge_energy_kwh > 0
-            else discharge_energy_kwh / INTERVAL_HOURS
+    blocks = _charge_blocks(inputs, thresholds.charge_per_kwh)
+    for position, gap in enumerate(_discharge_gaps(blocks, len(inputs.timestamps))):
+        stored_energy_kwh = minimum_energy_kwh + _allocate_discharge(
+            inputs,
+            discharge_energy_by_index,
+            available_energy_kwh=stored_energy_kwh - minimum_energy_kwh,
+            candidate_indices=gap,
+            minimum_price_per_kwh=_discharge_floor_per_kwh(
+                inputs, thresholds, blocks, position, refill_needed_kwh
+            ),
         )
+        if position >= len(blocks):
+            continue
+
+        block = blocks[position]
+        _allocate_block_charge(
+            inputs,
+            charge_energy_by_index,
+            block,
+            stored_energy_kwh=stored_energy_kwh,
+            target_energy_kwh=target_energy_kwh,
+        )
+        for index in block:
+            stored_energy_kwh += (
+                _absorbed_charge_kwh(
+                    battery,
+                    charge_energy_by_index[index],
+                    stored_energy_kwh,
+                    target_energy_kwh,
+                )
+                * battery.charge_efficiency
+            )
+
+    intervals, absorbed_charge_by_index = _build_intervals(
+        inputs, charge_energy_by_index, discharge_energy_by_index, target_energy_kwh
+    )
+    return OptimizationPlan(
+        intervals=intervals,
+        summary=_build_summary(
+            inputs,
+            intervals,
+            absorbed_charge_by_index,
+            discharge_energy_by_index,
+            full_charge_feasible=any(
+                _refill_capability_kwh(inputs, block) >= refill_needed_kwh
+                for block in blocks
+            ),
+        ),
+    )
+
+
+def _charge_blocks(
+    inputs: OptimizerInputs, charge_price_per_kwh: float
+) -> list[tuple[int, ...]]:
+    """Return the contiguous runs of intervals priced below the charge threshold."""
+    blocks: list[tuple[int, ...]] = []
+    current: list[int] = []
+    for index, price in enumerate(inputs.prices_per_kwh):
+        if price < charge_price_per_kwh:
+            current.append(index)
+        elif current:
+            blocks.append(tuple(current))
+            current = []
+    if current:
+        blocks.append(tuple(current))
+    return blocks
+
+
+def _discharge_gaps(
+    blocks: Sequence[tuple[int, ...]], interval_count: int
+) -> list[range]:
+    """Return the discharge windows around the charge blocks.
+
+    The result always holds one more entry than ``blocks``: entry ``k`` is the
+    window immediately preceding block ``k``, and the final entry is the tail of
+    the horizon after the last block. Entries may be empty.
+    """
+    gaps: list[range] = []
+    cursor = 0
+    for block in blocks:
+        gaps.append(range(cursor, block[0]))
+        cursor = block[-1] + 1
+    gaps.append(range(cursor, interval_count))
+    return gaps
+
+
+def _refill_capability_kwh(
+    inputs: OptimizerInputs, block: Sequence[int]
+) -> float:
+    """Return the energy one charge block can store when run at full power."""
+    battery = inputs.battery
+    return (
+        len(block)
+        * battery.max_charge_power_kw
+        * INTERVAL_HOURS
+        * battery.charge_efficiency
+    )
+
+
+def _discharge_floor_per_kwh(
+    inputs: OptimizerInputs,
+    thresholds: PriceThresholds,
+    blocks: Sequence[tuple[int, ...]],
+    position: int,
+    refill_needed_kwh: float,
+) -> float:
+    """Return the lowest price at which one gap may release stored energy."""
+    # Nothing is bought cheaply today, so the stored energy was never bought
+    # cheaply either and is released on the looser pre-charge threshold.
+    if not blocks:
+        return thresholds.pre_charge_discharge_per_kwh
+    # No block follows the final gap, so what is left has to last the horizon.
+    if position >= len(blocks):
+        return thresholds.post_charge_discharge_per_kwh
+
+    next_block = blocks[position]
+    if _refill_capability_kwh(inputs, next_block) >= refill_needed_kwh:
+        return _break_even_price_per_kwh(inputs, next_block, refill_needed_kwh)
+    return thresholds.pre_charge_discharge_per_kwh
+
+
+def _break_even_price_per_kwh(
+    inputs: OptimizerInputs,
+    block: Sequence[int],
+    refill_needed_kwh: float,
+) -> float:
+    """Return the price at which discharging beats refilling from one block.
+
+    A kWh delivered to the load costs one round trip of the refill price plus
+    the degradation of the cycle, so releasing energy below this price loses
+    money even though the battery is guaranteed to be refilled.
+    """
+    battery = inputs.battery
+    max_charge_energy_kwh = battery.max_charge_power_kw * INTERVAL_HOURS
+    stored_kwh = 0.0
+    grid_kwh = 0.0
+    refill_cost = 0.0
+    for price in sorted(inputs.prices_per_kwh[index] for index in block):
+        if stored_kwh >= refill_needed_kwh:
+            break
+        charge_energy_kwh = min(
+            max_charge_energy_kwh,
+            (refill_needed_kwh - stored_kwh) / battery.charge_efficiency,
+        )
+        stored_kwh += charge_energy_kwh * battery.charge_efficiency
+        grid_kwh += charge_energy_kwh
+        refill_cost += charge_energy_kwh * price
+
+    refill_price_per_kwh = refill_cost / grid_kwh if grid_kwh > 0 else 0.0
+    return (
+        refill_price_per_kwh
+        / (battery.charge_efficiency * battery.discharge_efficiency)
+        + battery.degradation_cost_per_kwh
+    )
+
+
+def _price_buckets(
+    inputs: OptimizerInputs, block: Sequence[int]
+) -> list[tuple[int, ...]]:
+    """Group one block's intervals into ascending fixed-width price buckets."""
+    buckets: dict[int, list[int]] = {}
+    for index in block:
+        key = floor(inputs.prices_per_kwh[index] / CHARGE_PRICE_BUCKET_WIDTH)
+        buckets.setdefault(key, []).append(index)
+    return [tuple(buckets[key]) for key in sorted(buckets)]
+
+
+def _allocate_block_charge(
+    inputs: OptimizerInputs,
+    charge_energy_by_index: list[float],
+    block: Sequence[int],
+    stored_energy_kwh: float,
+    target_energy_kwh: float,
+) -> None:
+    """Fill one charge block, spreading power evenly inside each price bucket.
+
+    Buckets are taken cheapest first. A bucket that can supply everything still
+    needed carries an equal share in each of its intervals; a bucket that cannot
+    runs at full power and the remainder descends to the next bucket up. The
+    request is deliberately larger than the deficit so that a battery charging
+    more slowly than commanded still reaches its target.
+    """
+    battery = inputs.battery
+    max_charge_energy_kwh = battery.max_charge_power_kw * INTERVAL_HOURS
+    deficit_kwh = (target_energy_kwh - stored_energy_kwh) / battery.charge_efficiency
+    if deficit_kwh <= ENERGY_EPSILON_KWH:
+        return
+
+    margin_kwh = (
+        CHARGE_MARGIN_FRACTION
+        * battery.usable_capacity_kwh
+        / battery.charge_efficiency
+    )
+    remaining_kwh = min(
+        deficit_kwh + margin_kwh, len(block) * max_charge_energy_kwh
+    )
+    for bucket in _price_buckets(inputs, block):
+        capability_kwh = len(bucket) * max_charge_energy_kwh
+        if capability_kwh >= remaining_kwh:
+            for index in bucket:
+                charge_energy_by_index[index] = remaining_kwh / len(bucket)
+            return
+        for index in bucket:
+            charge_energy_by_index[index] = max_charge_energy_kwh
+        remaining_kwh -= capability_kwh
+
+
+def _absorbed_charge_kwh(
+    battery: BatteryParameters,
+    commanded_charge_kwh: float,
+    stored_energy_kwh: float,
+    target_energy_kwh: float,
+) -> float:
+    """Return how much of one interval's commanded charge the battery can take.
+
+    Commanded charge carries the slow-charging margin, so the battery reaches
+    its target before the block ends and refuses the rest. Expected state of
+    charge and every cost figure follow this absorbed energy, not the command.
+    """
+    room_kwh = max(0.0, target_energy_kwh - stored_energy_kwh)
+    return min(commanded_charge_kwh, room_kwh / battery.charge_efficiency)
+
+
+def _build_intervals(
+    inputs: OptimizerInputs,
+    charge_energy_by_index: Sequence[float],
+    discharge_energy_by_index: Sequence[float],
+    target_energy_kwh: float,
+) -> tuple[list[PlanInterval], list[float]]:
+    """Render the allocations as plan intervals and the energy actually stored."""
+    battery = inputs.battery
+    intervals: list[PlanInterval] = []
+    absorbed_charge_by_index: list[float] = []
+    expected_energy_kwh = battery.usable_capacity_kwh * inputs.current_soc_percent / 100
+
+    for index, timestamp in enumerate(inputs.timestamps):
+        commanded_charge_kwh = charge_energy_by_index[index]
+        discharge_energy_kwh = discharge_energy_by_index[index]
+        absorbed_charge_kwh = _absorbed_charge_kwh(
+            battery, commanded_charge_kwh, expected_energy_kwh, target_energy_kwh
+        )
+        absorbed_charge_by_index.append(absorbed_charge_kwh)
+        expected_energy_kwh += absorbed_charge_kwh * battery.charge_efficiency
+        expected_energy_kwh -= discharge_energy_kwh / battery.discharge_efficiency
         intervals.append(
             PlanInterval(
                 timestamp=timestamp,
                 price_per_kwh=inputs.prices_per_kwh[index],
                 consumption_kwh=inputs.consumption_kwh[index],
-                target_battery_power_kw=target_power_kw,
+                target_battery_power_kw=(
+                    -commanded_charge_kwh / INTERVAL_HOURS
+                    if commanded_charge_kwh > 0
+                    else discharge_energy_kwh / INTERVAL_HOURS
+                ),
                 expected_soc_percent=(
                     expected_energy_kwh / battery.usable_capacity_kwh * 100
                 ),
                 state=(
                     OperatingState.CHARGE
-                    if charge_energy_kwh > 0
+                    if commanded_charge_kwh > 0
                     else OperatingState.DISCHARGE
                     if discharge_energy_kwh > 0
                     else OperatingState.IDLE
@@ -333,17 +532,27 @@ def create_greedy_charge_plan(
             )
         )
 
-    planned_charge_intervals = [
-        interval
+    return intervals, absorbed_charge_by_index
+
+
+def _build_summary(
+    inputs: OptimizerInputs,
+    intervals: Sequence[PlanInterval],
+    absorbed_charge_by_index: Sequence[float],
+    discharge_energy_by_index: Sequence[float],
+    full_charge_feasible: bool,
+) -> PlanSummary:
+    """Aggregate the plan using the energy the battery is expected to absorb."""
+    charge_prices = [
+        interval.price_per_kwh
         for interval in intervals
         if interval.state is OperatingState.CHARGE
     ]
-    planned_discharge_intervals = [
-        interval
+    discharge_prices = [
+        interval.price_per_kwh
         for interval in intervals
         if interval.state is OperatingState.DISCHARGE
     ]
-    total_charge_kwh = sum(charge_energy_by_index)
     total_discharge_kwh = sum(discharge_energy_by_index)
     cost_without_battery = sum(
         price * consumption
@@ -354,7 +563,7 @@ def create_greedy_charge_plan(
     charge_cost = sum(
         price * charge_energy
         for price, charge_energy in zip(
-            inputs.prices_per_kwh, charge_energy_by_index, strict=True
+            inputs.prices_per_kwh, absorbed_charge_by_index, strict=True
         )
     )
     avoided_grid_cost = sum(
@@ -363,54 +572,23 @@ def create_greedy_charge_plan(
             inputs.prices_per_kwh, discharge_energy_by_index, strict=True
         )
     )
-    degradation_cost = total_discharge_kwh * battery.degradation_cost_per_kwh
-    cost_with_battery = cost_without_battery + charge_cost - avoided_grid_cost + degradation_cost
-
-    return OptimizationPlan(
-        intervals=intervals,
-        summary=PlanSummary(
-            total_charge_kwh=total_charge_kwh,
-            total_discharge_kwh=total_discharge_kwh,
-            highest_charge_price_per_kwh=(
-                max(interval.price_per_kwh for interval in planned_charge_intervals)
-                if planned_charge_intervals
-                else None
-            ),
-            lowest_discharge_price_per_kwh=(
-                min(interval.price_per_kwh for interval in planned_discharge_intervals)
-                if planned_discharge_intervals
-                else None
-            ),
-            cost_without_battery=cost_without_battery,
-            cost_with_battery=cost_with_battery,
-            daily_saving=cost_without_battery - cost_with_battery,
-        ),
+    degradation_cost = total_discharge_kwh * inputs.battery.degradation_cost_per_kwh
+    cost_with_battery = (
+        cost_without_battery + charge_cost - avoided_grid_cost + degradation_cost
     )
 
-
-def _allocate_charge(
-    inputs: OptimizerInputs,
-    charge_energy_by_index: list[float],
-    starting_energy_kwh: float,
-    target_energy_kwh: float,
-    candidate_indices: Sequence[int],
-) -> float:
-    """Fill available battery capacity in price-order charge candidates."""
-    stored_energy_kwh = starting_energy_kwh
-    max_charge_energy_kwh = inputs.battery.max_charge_power_kw * INTERVAL_HOURS
-
-    for index in candidate_indices:
-        energy_needed_from_grid_kwh = (
-            target_energy_kwh - stored_energy_kwh
-        ) / inputs.battery.charge_efficiency
-        if energy_needed_from_grid_kwh <= 0:
-            break
-
-        charge_energy_kwh = min(max_charge_energy_kwh, energy_needed_from_grid_kwh)
-        charge_energy_by_index[index] = charge_energy_kwh
-        stored_energy_kwh += charge_energy_kwh * inputs.battery.charge_efficiency
-
-    return stored_energy_kwh
+    return PlanSummary(
+        total_charge_kwh=sum(absorbed_charge_by_index),
+        total_discharge_kwh=total_discharge_kwh,
+        highest_charge_price_per_kwh=max(charge_prices) if charge_prices else None,
+        lowest_discharge_price_per_kwh=(
+            min(discharge_prices) if discharge_prices else None
+        ),
+        cost_without_battery=cost_without_battery,
+        cost_with_battery=cost_with_battery,
+        daily_saving=cost_without_battery - cost_with_battery,
+        full_charge_feasible=full_charge_feasible,
+    )
 
 
 def _allocate_discharge(
@@ -434,13 +612,15 @@ def _allocate_discharge(
 
     remaining_energy_kwh = available_energy_kwh
     for index in eligible_indices:
-        if remaining_energy_kwh <= 0:
+        if remaining_energy_kwh <= ENERGY_EPSILON_KWH:
             break
         load_energy_kwh = min(
             inputs.consumption_kwh[index],
             max_discharge_kwh,
             remaining_energy_kwh * inputs.battery.discharge_efficiency,
         )
+        if load_energy_kwh <= ENERGY_EPSILON_KWH:
+            continue
         discharge_energy_by_index[index] = load_energy_kwh
         remaining_energy_kwh -= load_energy_kwh / inputs.battery.discharge_efficiency
 
