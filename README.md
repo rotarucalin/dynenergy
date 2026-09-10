@@ -111,11 +111,30 @@ $$
 T_{post}=\max\left(0.13, P_{min}+0.70(P_{max}-P_{min})\right)
 $$
 
-All prices are in EUR/kWh. The algorithm first uses energy already above the
-configured minimum SOC to cover expensive demand before charging. It then fills
-the battery in the cheapest slots strictly below $T_{charge}$. After the final
-charge slot, it may discharge any available energy above minimum SOC into later
-demand at or above $T_{post}$; the battery does not need to reach maximum SOC.
+All prices are in EUR/kWh. The horizon is split into contiguous blocks of
+intervals priced strictly below $T_{charge}$ and the discharge gaps around them,
+then walked in order, so a day with a cheap night and a cheap midday runs two
+charge and discharge cycles. Each gap is planned against the block that follows
+it: when that block can refill the battery on its own the gap may empty it down
+to minimum SOC, otherwise energy is held back for $T_{pre}$. The final gap, with
+no block after it, uses $T_{post}$.
+
+Within a block, intervals are grouped into 1 ct/kWh buckets and taken cheapest
+first. A bucket that can supply everything still needed carries an equal share
+in each of its intervals; a bucket that cannot runs at full power and the
+remainder descends to the next bucket up. The request is 20% of usable capacity
+larger than the deficit, so a battery charging more slowly than commanded still
+reaches its target. That margin is commanded but never counted as absorbed.
+
+Discharge is normally limited to the forecast demand of the interval. When a
+price climbs more than 30 ct/kWh above the cost basis of the stored energy, the
+interval is treated as a spike: it qualifies on its own, without also clearing
+the discharge threshold, and is planned at full discharge power. The battery
+automation scales the request down to whatever the house is really drawing, so
+the plan reports the part booked above the forecast separately as
+`spike_discharge_kwh`. The cost basis is the average price the plan pays in the
+charge blocks already walked, falling back to the measured `Stored energy cost`
+for the part of the day before the first block.
 
 The initial demand profile is 0.3125 kWh (an average 1.25 kW) per 15 minutes
 from Monday to Thursday, 07:45-18:30, and Friday, 07:45-13:30. All other
@@ -133,7 +152,7 @@ DynEnergy creates these sensors:
 | Battery plan | EUR | Expected daily EPEX saving from the current day-ahead plan. Its attributes contain the full schedule, plan summary, source readings, and status. |
 | Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
 | Typical consumption | W | Learned average for the current weekly slot. Its attributes contain all 672 weekly averages and their sample counts. |
-| Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. |
+| Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. Its attributes add the stored energy, the total charged energy, and the lifetime average price paid per charged kWh. |
 | Total costs | EUR | Cumulative EPEX value of actual measured battery charging. |
 | Total savings | EUR | Cumulative EPEX value of actual measured battery discharge. |
 
@@ -154,13 +173,22 @@ $$
 $$
 
 At first installation, the energy implied by current SOC and usable capacity is
-entered with a cost of EUR 0. The current energy-counter readings become the
-baseline, so previous charging and discharging never appear in `Total costs`
-or `Total savings`. The ledger is saved across Home Assistant restarts.
+entered at the current EPEX price. What it really cost is unknowable, but a zero
+basis would understate every average until that energy is discharged. The
+current energy-counter readings become the baseline, so previous charging and
+discharging never appear in `Total costs` or `Total savings`. The ledger is
+saved across Home Assistant restarts.
 
-When upgrading from the earlier estimated accounting formula, the previous
-totals are reset because they cannot be corrected without historical meter
-readings.
+How much energy the battery holds is taken from SOC and usable capacity on every
+update, not from the meter deltas. A round trip charges more than it discharges,
+so a ledger driven by deltas alone climbs past the physical capacity and turns
+the cost basis into a lifetime average over energy that is not there. Re-reading
+the real value keeps the divisor honest whichever side of the inverter the
+counters sit on, and the recorded cost is scaled with the correction so that
+fixing the amount of energy never silently reprices it.
+
+When upgrading from an earlier accounting version, the previous totals are reset
+because they cannot be corrected without historical meter readings.
 
 This accounting uses spot EPEX prices only. It does not include electricity
 taxes, network charges, VAT, fixed tariff components, export remuneration, or

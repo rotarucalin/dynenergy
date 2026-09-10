@@ -23,6 +23,9 @@ PRE_CHARGE_DISCHARGE_PRICE_BAND = 0.50
 POST_CHARGE_DISCHARGE_PRICE_BAND = 0.70
 CHARGE_PRICE_BUCKET_WIDTH = 0.01
 CHARGE_MARGIN_FRACTION = 0.20
+# How far above the cost basis of the stored energy a price has to climb before
+# the forecast load stops limiting the discharge.
+SPIKE_PREMIUM_PER_KWH = 0.30
 # Allocations below this are rounding residue, not a usable battery instruction.
 ENERGY_EPSILON_KWH = 1e-9
 
@@ -58,6 +61,9 @@ class OptimizerInputs:
     consumption_kwh: Sequence[float]
     current_soc_percent: float
     battery: BatteryParameters
+    # Measured cost basis of the energy already in the battery. Only the part of
+    # the horizon before the first charge block depends on it.
+    stored_energy_cost_per_kwh: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +93,7 @@ class PlanSummary:
 
     total_charge_kwh: float
     total_discharge_kwh: float
+    spike_discharge_kwh: float
     highest_charge_price_per_kwh: float | None
     lowest_discharge_price_per_kwh: float | None
     cost_without_battery: float
@@ -264,6 +271,7 @@ def create_greedy_charge_plan(
     stored_energy_kwh = battery.usable_capacity_kwh * inputs.current_soc_percent / 100
     charge_energy_by_index = [0.0] * len(inputs.timestamps)
     discharge_energy_by_index = [0.0] * len(inputs.timestamps)
+    basis = _CostBasis(inputs)
 
     blocks = _charge_blocks(inputs, thresholds.charge_per_kwh)
     for position, gap in enumerate(_discharge_gaps(blocks, len(inputs.timestamps))):
@@ -275,6 +283,7 @@ def create_greedy_charge_plan(
             minimum_price_per_kwh=_discharge_floor_per_kwh(
                 inputs, thresholds, blocks, position, refill_needed_kwh
             ),
+            spike_price_per_kwh=basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
         )
         if position >= len(blocks):
             continue
@@ -288,15 +297,14 @@ def create_greedy_charge_plan(
             target_energy_kwh=target_energy_kwh,
         )
         for index in block:
-            stored_energy_kwh += (
-                _absorbed_charge_kwh(
-                    battery,
-                    charge_energy_by_index[index],
-                    stored_energy_kwh,
-                    target_energy_kwh,
-                )
-                * battery.charge_efficiency
+            absorbed_charge_kwh = _absorbed_charge_kwh(
+                battery,
+                charge_energy_by_index[index],
+                stored_energy_kwh,
+                target_energy_kwh,
             )
+            stored_energy_kwh += absorbed_charge_kwh * battery.charge_efficiency
+            basis.add(absorbed_charge_kwh, inputs.prices_per_kwh[index])
 
     intervals, absorbed_charge_by_index = _build_intervals(
         inputs, charge_energy_by_index, discharge_energy_by_index, target_energy_kwh
@@ -314,6 +322,38 @@ def create_greedy_charge_plan(
             ),
         ),
     )
+
+
+class _CostBasis:
+    """Running average price paid for the energy the plan has bought so far.
+
+    Each discharge gap is priced against the blocks already walked, so the
+    spike trigger follows what the stored energy actually cost rather than the
+    day's cheapest price. Before the first block there is nothing planned yet
+    and the measured basis carried on the inputs stands in for it.
+    """
+
+    __slots__ = ("_cost", "_energy_kwh", "_opening_per_kwh")
+
+    def __init__(self, inputs: OptimizerInputs) -> None:
+        self._cost = 0.0
+        self._energy_kwh = 0.0
+        self._opening_per_kwh = (
+            inputs.stored_energy_cost_per_kwh
+            if inputs.stored_energy_cost_per_kwh is not None
+            else min(inputs.prices_per_kwh)
+        )
+
+    def add(self, energy_kwh: float, price_per_kwh: float) -> None:
+        """Fold one interval's purchase into the running average."""
+        self._energy_kwh += energy_kwh
+        self._cost += energy_kwh * price_per_kwh
+
+    def per_kwh(self) -> float:
+        """Return the current cost basis of the stored energy."""
+        if self._energy_kwh <= ENERGY_EPSILON_KWH:
+            return self._opening_per_kwh
+        return self._cost / self._energy_kwh
 
 
 def _charge_blocks(
@@ -554,6 +594,14 @@ def _build_summary(
         if interval.state is OperatingState.DISCHARGE
     ]
     total_discharge_kwh = sum(discharge_energy_by_index)
+    # What the plan asks for beyond the forecast load only flows if the house is
+    # really drawing that much, so it is reported separately from the rest.
+    spike_discharge_kwh = sum(
+        max(0.0, discharge_energy - consumption)
+        for discharge_energy, consumption in zip(
+            discharge_energy_by_index, inputs.consumption_kwh, strict=True
+        )
+    )
     cost_without_battery = sum(
         price * consumption
         for price, consumption in zip(
@@ -580,6 +628,7 @@ def _build_summary(
     return PlanSummary(
         total_charge_kwh=sum(absorbed_charge_by_index),
         total_discharge_kwh=total_discharge_kwh,
+        spike_discharge_kwh=spike_discharge_kwh,
         highest_charge_price_per_kwh=max(charge_prices) if charge_prices else None,
         lowest_discharge_price_per_kwh=(
             min(discharge_prices) if discharge_prices else None
@@ -597,15 +646,26 @@ def _allocate_discharge(
     available_energy_kwh: float,
     candidate_indices: Sequence[int],
     minimum_price_per_kwh: float,
+    spike_price_per_kwh: float,
 ) -> float:
-    """Allocate stored energy to the highest-priced eligible demand intervals."""
+    """Allocate stored energy to the highest-priced eligible demand intervals.
+
+    Ordinary intervals are limited to the forecast load, because anything past
+    it would be guesswork. A price spike is worth so much more than the stored
+    energy cost that the forecast stops being the binding constraint: the plan
+    asks for full power and leaves it to the battery automation, which scales
+    the request down to whatever the house is really drawing.
+    """
     max_discharge_kwh = inputs.battery.max_discharge_power_kw * INTERVAL_HOURS
     eligible_indices = sorted(
         (
             index
             for index in candidate_indices
-            if inputs.prices_per_kwh[index] >= minimum_price_per_kwh
-            and inputs.consumption_kwh[index] > 0
+            if _is_price_spike(inputs, index, spike_price_per_kwh)
+            or (
+                inputs.prices_per_kwh[index] >= minimum_price_per_kwh
+                and inputs.consumption_kwh[index] > 0
+            )
         ),
         key=lambda index: (-inputs.prices_per_kwh[index], inputs.timestamps[index]),
     )
@@ -615,8 +675,7 @@ def _allocate_discharge(
         if remaining_energy_kwh <= ENERGY_EPSILON_KWH:
             break
         load_energy_kwh = min(
-            inputs.consumption_kwh[index],
-            max_discharge_kwh,
+            _discharge_cap_kwh(inputs, index, spike_price_per_kwh, max_discharge_kwh),
             remaining_energy_kwh * inputs.battery.discharge_efficiency,
         )
         if load_energy_kwh <= ENERGY_EPSILON_KWH:
@@ -625,6 +684,30 @@ def _allocate_discharge(
         remaining_energy_kwh -= load_energy_kwh / inputs.battery.discharge_efficiency
 
     return remaining_energy_kwh
+
+
+def _is_price_spike(
+    inputs: OptimizerInputs, index: int, spike_price_per_kwh: float
+) -> bool:
+    """Return whether one interval clears the spike premium over the cost basis.
+
+    A spike qualifies on its own and is not also held to the discharge price
+    floor: the floor tracks the shape of the day's price range, so a genuine
+    spike on a volatile day can sit below it and would otherwise be dropped.
+    """
+    return inputs.prices_per_kwh[index] >= spike_price_per_kwh
+
+
+def _discharge_cap_kwh(
+    inputs: OptimizerInputs,
+    index: int,
+    spike_price_per_kwh: float,
+    max_discharge_kwh: float,
+) -> float:
+    """Return the most energy one interval may draw from the battery."""
+    if _is_price_spike(inputs, index, spike_price_per_kwh):
+        return max_discharge_kwh
+    return min(inputs.consumption_kwh[index], max_discharge_kwh)
 
 
 def _validate_charge_inputs(

@@ -246,13 +246,15 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             ):
                 raise ValueError("Missing cumulative battery charged or discharged energy")
 
+            measured_energy_kwh = self._measured_stored_energy_kwh(data)
             if not self._account.initialized:
-                if data.current_soc_percent is None or data.usable_capacity_kwh is None:
+                if measured_energy_kwh is None:
                     raise ValueError("Missing SOC or usable capacity for accounting baseline")
                 self._account = self._account.initialize(
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
-                    data.usable_capacity_kwh * data.current_soc_percent / 100,
+                    measured_energy_kwh,
+                    self._current_price_per_kwh(now),
                 )
             elif self._account.has_positive_meter_delta(
                 data.battery_charged_energy_kwh, data.battery_discharged_energy_kwh
@@ -261,12 +263,14 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
                     self._current_price_per_kwh(now),
+                    measured_energy_kwh,
                 )
             else:
                 self._account = self._account.record(
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
                     0.0,
+                    measured_energy_kwh,
                 )
         except (KeyError, TypeError, ValueError) as err:
             LOGGER.warning("Unable to update DynEnergy battery accounting: %s", err)
@@ -284,6 +288,13 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             await self._account_store.async_save(self._account.as_dict())
             self._account_dirty = False
         self.async_set_updated_data(self._read_data(current_plan, planning_error))
+
+    @staticmethod
+    def _measured_stored_energy_kwh(data: DynEnergyData) -> float | None:
+        """Return the energy the battery reports holding, when both inputs exist."""
+        if data.current_soc_percent is None or data.usable_capacity_kwh is None:
+            return None
+        return data.usable_capacity_kwh * data.current_soc_percent / 100
 
     def _start_consumption_tracking(self, now: datetime) -> None:
         """Capture a grid-import baseline without learning a partial interval."""
@@ -435,6 +446,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             ],
             current_soc_percent=data.current_soc_percent,
             battery=battery,
+            stored_energy_cost_per_kwh=(
+                data.account.stored_energy_cost_per_kwh
+                if data.account.initialized
+                else None
+            ),
         )
         return create_greedy_charge_plan(
             inputs,

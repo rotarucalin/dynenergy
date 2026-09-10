@@ -256,6 +256,18 @@ class DynEnergyStoredEnergyCostSensor(
         """Return the current stored-energy weighted average in cents."""
         return self.coordinator.data.account.stored_energy_cost_per_kwh * 100
 
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose the lifetime average price paid for charged energy."""
+        account = self.coordinator.data.account
+        return {
+            "stored_energy_kwh": account.stored_energy_kwh,
+            "total_charged_kwh": account.total_charged_kwh,
+            "average_charge_price_ct_per_kwh": (
+                account.average_charge_price_per_kwh * 100
+            ),
+        }
+
 
 class DynEnergyTotalChargingCostSensor(
     CoordinatorEntity[DynEnergyCoordinator], SensorEntity

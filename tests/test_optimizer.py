@@ -11,6 +11,7 @@ from custom_components.dynenergy.optimizer import (
     INTERVAL_HOURS,
     INTERVALS_PER_DAY,
     INTERVALS_PER_WEEK,
+    SPIKE_PREMIUM_PER_KWH,
     BatteryParameters,
     OperatingState,
     OptimizerInputs,
@@ -154,16 +155,34 @@ def _prices(*segments: tuple[int, float]) -> list[float]:
 
 
 def _solar_day_prices() -> list[float]:
-    """Return a day whose cheap hours fall both at night and at midday."""
+    """Return a day whose cheap hours fall both at night and at midday.
+
+    The evening peak stays under the spike premium over the ~0.045 charge
+    basis, so these two curves exercise the charge and D1 logic on their own.
+    """
     return _prices(
-        (24, 0.05), (16, 0.15), (20, 0.04), (8, 0.20), (16, 0.35), (12, 0.15)
+        (24, 0.05), (16, 0.15), (20, 0.04), (8, 0.20), (16, 0.30), (12, 0.15)
     )
 
 
 def _short_midday_prices() -> list[float]:
     """Return the same day with a midday block too short to refill the battery."""
     return _prices(
-        (24, 0.05), (16, 0.15), (4, 0.04), (24, 0.20), (16, 0.35), (12, 0.15)
+        (24, 0.05), (16, 0.15), (4, 0.04), (24, 0.20), (16, 0.30), (12, 0.15)
+    )
+
+
+# Cheap night at 0.05 fills the battery, so the cost basis is 0.05 and the spike
+# premium puts the trigger at 0.35. The 0.40 window is a spike that sits below
+# the 0.435 post-charge floor; the 0.60 window clears both.
+_SPIKE_BELOW_FLOOR = slice(70, 74)
+_SPIKE_ABOVE_FLOOR = slice(74, 76)
+
+
+def _spike_day_prices() -> list[float]:
+    """Return a flat day broken by two evening spikes of different heights."""
+    return _prices(
+        (24, 0.05), (46, 0.20), (4, 0.40), (2, 0.60), (20, 0.20)
     )
 
 
@@ -171,6 +190,7 @@ def _inputs(
     prices: list[float],
     current_soc_percent: float = MIN_SOC_PERCENT,
     battery: BatteryParameters | None = None,
+    stored_energy_cost_per_kwh: float | None = None,
 ) -> OptimizerInputs:
     return OptimizerInputs(
         timestamps=[
@@ -181,11 +201,16 @@ def _inputs(
         consumption_kwh=[CONSUMPTION_KWH] * len(prices),
         current_soc_percent=current_soc_percent,
         battery=battery or _battery(),
+        stored_energy_cost_per_kwh=stored_energy_cost_per_kwh,
     )
 
 
 def _charge_power_kw(interval: PlanInterval) -> float:
     return round(-interval.target_battery_power_kw, 9)
+
+
+def _discharge_kwh(interval: PlanInterval) -> float:
+    return round(interval.target_battery_power_kw * INTERVAL_HOURS, 9)
 
 
 def test_solar_day_runs_two_charge_and_discharge_cycles() -> None:
@@ -309,12 +334,128 @@ def test_plan_respects_soc_limits_and_forecast_load() -> None:
     for interval in plan.intervals:
         assert MIN_SOC_PERCENT <= interval.expected_soc_percent <= MAX_SOC_PERCENT
         if interval.state is OperatingState.DISCHARGE:
-            assert (
-                interval.target_battery_power_kw * INTERVAL_HOURS
-                <= interval.consumption_kwh + 1e-9
-            )
+            assert _discharge_kwh(interval) <= interval.consumption_kwh + 1e-9
 
+    assert plan.summary.spike_discharge_kwh == 0
     assert plan.summary.daily_saving == pytest.approx(
         plan.summary.cost_without_battery - plan.summary.cost_with_battery
     )
+
+
+def test_price_spike_discharges_above_the_forecast_load() -> None:
+    """A price far above the cost basis runs the battery at full power."""
+    plan = create_greedy_charge_plan(
+        _inputs(_spike_day_prices()), CHARGE_THRESHOLD_PER_KWH
+    )
+    spike = plan.intervals[_SPIKE_ABOVE_FLOOR]
+
+    assert all(interval.state is OperatingState.DISCHARGE for interval in spike)
+    assert all(
+        _discharge_kwh(interval) == pytest.approx(MAX_POWER_KW * INTERVAL_HOURS)
+        for interval in spike
+    )
+    assert MAX_POWER_KW * INTERVAL_HOURS > CONSUMPTION_KWH
+
+
+def test_price_spike_below_the_discharge_floor_is_still_used() -> None:
+    """The spike premium qualifies an interval on its own, ignoring the floor."""
+    inputs = _inputs(_spike_day_prices())
+    thresholds = calculate_price_thresholds(inputs, CHARGE_THRESHOLD_PER_KWH)
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    spike = plan.intervals[_SPIKE_BELOW_FLOOR]
+
+    # Without the spike rule the price floor alone would reject these intervals.
+    assert all(
+        interval.price_per_kwh < thresholds.post_charge_discharge_per_kwh
+        for interval in spike
+    )
+    assert all(
+        _discharge_kwh(interval) == pytest.approx(MAX_POWER_KW * INTERVAL_HOURS)
+        for interval in spike
+    )
+
+
+def test_prices_below_the_spike_premium_stay_capped_by_the_forecast() -> None:
+    """An ordinary expensive interval is still limited to the forecast load."""
+    plan = create_greedy_charge_plan(
+        _inputs(_spike_day_prices()), CHARGE_THRESHOLD_PER_KWH
+    )
+    discharging = [
+        interval
+        for interval in plan.intervals
+        if interval.state is OperatingState.DISCHARGE
+        and interval.price_per_kwh < 0.35
+    ]
+
+    assert all(
+        _discharge_kwh(interval) <= CONSUMPTION_KWH + 1e-9 for interval in discharging
+    )
+
+
+def test_spike_premium_is_measured_against_the_planned_charge_price() -> None:
+    """The trigger follows what the plan paid, not the cheapest price of the day."""
+    # A short 0.01 dip drags the day minimum well below the 0.049 the block
+    # actually pays on average, and 0.33 falls between the two triggers.
+    prices = _prices((4, 0.01), (20, 0.08), (56, 0.20), (16, 0.33))
+    plan = create_greedy_charge_plan(
+        _inputs(prices, stored_energy_cost_per_kwh=0.01), CHARGE_THRESHOLD_PER_KWH
+    )
+    evening = plan.intervals[80:96]
+
+    assert 0.01 + SPIKE_PREMIUM_PER_KWH < 0.33 < 0.049 + SPIKE_PREMIUM_PER_KWH
+    assert any(interval.state is OperatingState.DISCHARGE for interval in evening)
+    assert all(
+        _discharge_kwh(interval) <= CONSUMPTION_KWH + 1e-9 for interval in evening
+    )
+    assert plan.summary.spike_discharge_kwh == 0
+
+
+def test_measured_cost_basis_drives_the_gap_before_the_first_block() -> None:
+    """Nothing is planned yet before the first block, so the account value rules."""
+    prices = _prices((8, 0.40), (24, 0.05), (64, 0.20))
+
+    def morning(stored_energy_cost_per_kwh: float | None) -> list[PlanInterval]:
+        plan = create_greedy_charge_plan(
+            _inputs(
+                prices,
+                current_soc_percent=MAX_SOC_PERCENT,
+                stored_energy_cost_per_kwh=stored_energy_cost_per_kwh,
+            ),
+            CHARGE_THRESHOLD_PER_KWH,
+        )
+        return plan.intervals[0:8]
+
+    cheap_basis = morning(0.05)
+    dear_basis = morning(0.15)
+
+    # 0.40 clears 0.05 + 0.30 but not 0.15 + 0.30.
+    assert all(
+        _discharge_kwh(interval) == pytest.approx(MAX_POWER_KW * INTERVAL_HOURS)
+        for interval in cheap_basis
+    )
+    assert all(
+        _discharge_kwh(interval) <= CONSUMPTION_KWH + 1e-9 for interval in dear_basis
+    )
+    # Omitting the measured basis falls back to the cheapest price of the day.
+    assert [_discharge_kwh(interval) for interval in morning(None)] == [
+        _discharge_kwh(interval) for interval in cheap_basis
+    ]
+
+
+def test_summary_reports_the_discharge_booked_above_the_forecast() -> None:
+    """Energy that only flows if the house really draws it is reported apart."""
+    plan = create_greedy_charge_plan(
+        _inputs(_spike_day_prices()), CHARGE_THRESHOLD_PER_KWH
+    )
+    spike_intervals = plan.intervals[_SPIKE_BELOW_FLOOR] + plan.intervals[
+        _SPIKE_ABOVE_FLOOR
+    ]
+
+    assert plan.summary.spike_discharge_kwh == pytest.approx(
+        sum(
+            _discharge_kwh(interval) - interval.consumption_kwh
+            for interval in spike_intervals
+        )
+    )
+    assert plan.summary.spike_discharge_kwh > 0
     assert plan.summary.daily_saving > 0
