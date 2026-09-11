@@ -305,7 +305,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                     except (KeyError, TypeError, ValueError) as err:
                         self._account = baseline
                         monitoring_error = (
-                            f"Unable to price completed battery interval; "
+                            "Unable to price completed battery interval; "
                             f"meter baselines reset: {err}"
                         )
             self._account_interval_start = interval_start
@@ -325,7 +325,9 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             await self._account_store.async_save(self._account.as_dict())
             self._account_dirty = False
         if monitoring_error:
-            LOGGER.warning("Unable to update DynEnergy battery accounting: %s", monitoring_error)
+            LOGGER.warning(
+                "Unable to update DynEnergy battery accounting: %s", monitoring_error
+            )
         self.async_set_updated_data(
             self._read_data(current_plan, planning_error, monitoring_error)
         )

@@ -149,6 +149,33 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
         await self.update(15)
         self.assert_totals(0.05, 0.025)
 
+    async def assert_clock_transition(self, start_text, end_text):
+        start = datetime.fromisoformat(start_text)
+        end = datetime.fromisoformat(end_text)
+        self.prices.clear()
+        self.prices.append({
+            "start_time": start_text,
+            "end_time": end_text,
+            "price_per_kwh": 0.05,
+        })
+        self.add_price(end, 0.50)
+        await self.coordinator._async_monitor_battery_energy(start)
+        self.charged += 1.0
+        self.discharged += 0.5
+        await self.coordinator._async_monitor_battery_energy(end)
+        self.assert_totals(0.05, 0.025)
+        self.assertIsNone(self.coordinator.data.monitoring_error)
+
+    async def test_spring_clock_change_closes_one_real_quarter(self):
+        await self.assert_clock_transition(
+            "2026-03-29T01:45:00+01:00", "2026-03-29T03:00:00+02:00"
+        )
+
+    async def test_autumn_repeated_hour_closes_one_real_quarter(self):
+        await self.assert_clock_transition(
+            "2026-10-25T02:45:00+02:00", "2026-10-25T02:00:00+01:00"
+        )
+
     async def test_startup_does_not_book_old_counters_or_require_soc(self):
         self.soc = None
         await self.update(7)

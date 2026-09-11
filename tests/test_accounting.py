@@ -60,6 +60,36 @@ def test_drifted_version_two_state_is_discarded() -> None:
     assert account == BatteryCostAccount()
 
 
+def test_version_three_ledger_resets_once_for_quarter_hour_accounting() -> None:
+    """Old totals reset; fresh readings and version-4 totals survive reloads."""
+    account = BatteryCostAccount.from_dict(
+        {
+            "accounting_version": 3,
+            "stored_energy_kwh": 2.0,
+            "stored_energy_cost_eur": 0.20,
+            "total_charged_kwh": 100.0,
+            "total_charging_cost_eur": 10.0,
+            "total_saved_cost_eur": 20.0,
+            "previous_charged_energy_kwh": 100.0,
+            "previous_discharged_energy_kwh": 80.0,
+            "initialized": True,
+        }
+    )
+    assert account == BatteryCostAccount()
+
+    account = account.initialize(110.0, 85.0, 3.0, 0.10)
+    assert account.total_charged_kwh == 0.0
+    assert account.total_charging_cost_eur == 0.0
+    assert account.total_saved_cost_eur == 0.0
+    assert isclose(account.stored_energy_cost_eur, 0.30)
+
+    account = account.record(110.2, 85.1, 0.25)
+    assert isclose(account.total_charging_cost_eur, 0.05)
+    assert isclose(account.total_saved_cost_eur, 0.025)
+    assert account.as_dict()["accounting_version"] == 4
+    assert BatteryCostAccount.from_dict(account.as_dict()) == account
+
+
 def test_stored_energy_follows_the_measured_battery() -> None:
     """Meter deltas never decide how much energy the battery is holding."""
     account = BatteryCostAccount().initialize(0.0, 0.0, 1.0, 0.10)

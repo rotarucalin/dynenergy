@@ -20,7 +20,7 @@ realized EPEX savings when that energy is discharged.
   a 13 ct/kWh minimum discharge price.
 - Discharges existing energy before charging and available energy after charging
   to the highest-priced eligible household demand slots.
-- Monitors cumulative battery charged/discharged energy every minute and
+- Monitors cumulative battery charged/discharged energy every 15 minutes and
   publishes the cost of stored energy, total charging costs, and total savings.
 - Learns a persistent 672-slot weekly consumption profile from the cumulative
   grid-import meter and exposes it through the Typical consumption sensor.
@@ -158,8 +158,9 @@ DynEnergy creates these sensors:
 
 ## Battery Cost Monitoring
 
-Every minute, DynEnergy compares the two configured cumulative battery-energy
-counters with their previous readings. Actual charged consumption $\Delta E_c$
+At each quarter-hour boundary (00, 15, 30, and 45 minutes), DynEnergy compares
+the two configured cumulative battery-energy counters with their previous
+readings. Actual charged consumption $\Delta E_c$
 updates `Total costs` by:
 
 $$
@@ -172,12 +173,30 @@ $$
 \Delta E_dP_{EPEX}
 $$
 
+Both calculations use the EPEX price of the **completed** interval. For example,
+at 12:15 the counter differences since 12:00 are multiplied by the price for
+12:00-12:15. The interval price is cached so a price-data rollover at midnight
+does not replace it with the next day's price. Accounting runs even when the
+price stays unchanged between quarters; there is no minutely accounting timer.
+
+These totals use the measured energy deltas directly, without efficiency,
+SOC, or stored-energy cost deductions. `Total savings` is the gross avoided
+energy cost; subtract `Total costs` to obtain the net monetary balance.
+
 At first installation, the energy implied by current SOC and usable capacity is
 entered at the current EPEX price. What it really cost is unknowable, but a zero
 basis would understate every average until that energy is discharged. The
 current energy-counter readings become the baseline, so previous charging and
 discharging never appear in `Total costs` or `Total savings`. The ledger is
-saved across Home Assistant restarts.
+saved after each accounting update. Missing SOC does not prevent the two
+monetary totals from being recorded.
+
+Existing totals are preserved across Home Assistant restarts, and the current
+meter readings become a fresh baseline. The first quarter-hour update accounts
+for the observed portion of that interval since startup. Energy used during
+downtime is not estimated. A missed boundary, missing meter readings, or a
+completed interval whose price is unavailable causes a baseline reset and a
+`monitoring_error`, rather than assigning a later interval's price to the gap.
 
 How much energy the battery holds is taken from SOC and usable capacity on every
 update, not from the meter deltas. A round trip charges more than it discharges,
@@ -187,8 +206,12 @@ the real value keeps the divisor honest whichever side of the inverter the
 counters sit on, and the recorded cost is scaled with the correction so that
 fixing the amount of energy never silently reprices it.
 
-When upgrading from an earlier accounting version, the previous totals are reset
-because they cannot be corrected without historical meter readings.
+Accounting version 4 resets the previous ledger once when the updated integration
+starts, so `Total costs` and `Total savings` begin at zero with quarter-hour
+accounting. The current meter readings become fresh baselines, and the stored
+energy cost basis is initialized again from SOC and the current price. Subsequent
+restarts preserve the new totals. Earlier totals cannot be corrected without
+historical meter readings.
 
 This accounting uses spot EPEX prices only. It does not include electricity
 taxes, network charges, VAT, fixed tariff components, export remuneration, or

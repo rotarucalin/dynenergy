@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 _EPSILON = 1e-9
-_ACCOUNTING_VERSION = 3
+_ACCOUNTING_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
