@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -69,7 +69,6 @@ _ENERGY_SCALE_TO_KWH: Mapping[str, float] = {
     UnitOfEnergy.MEGA_WATT_HOUR: 1000.0,
 }
 _SOC_SCALE_TO_PERCENT: Mapping[str, float] = {PERCENTAGE: 1.0}
-_ACCOUNT_SAVE_INTERVAL_MINUTES = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +104,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self.entry = entry
         self._unsub_plan: Callable[[], None] | None = None
         self._unsub_apply: Callable[[], None] | None = None
-        self._unsub_monitor: Callable[[], None] | None = None
         self._last_target_power_w: int | None = None
         self._account = BatteryCostAccount()
         self._account_dirty = False
+        self._account_interval_start: datetime | None = None
+        self._account_interval_price_per_kwh: float | None = None
         self._account_store: Store[dict[str, object]] = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.account"
         )
@@ -140,12 +140,6 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             minute=range(0, 60, 15),
             second=0,
         )
-        self._unsub_monitor = async_track_time_change(
-            self.hass,
-            self._async_monitor_battery_energy,
-            minute=range(60),
-            second=0,
-        )
         now = dt_util.now()
         self._start_consumption_tracking(now)
         await self._async_monitor_battery_energy(now)
@@ -154,12 +148,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def async_shutdown(self) -> None:
         """Stop scheduled callbacks and leave the charge target idle."""
-        for unsubscribe in (self._unsub_plan, self._unsub_apply, self._unsub_monitor):
+        for unsubscribe in (self._unsub_plan, self._unsub_apply):
             if unsubscribe:
                 unsubscribe()
         self._unsub_plan = None
         self._unsub_apply = None
-        self._unsub_monitor = None
         await self._async_set_battery_power_target(0)
         if self._account_dirty:
             await self._account_store.async_save(self._account.as_dict())
@@ -167,7 +160,8 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         await super().async_shutdown()
 
     async def _async_run_interval_tasks(self, now: datetime) -> None:
-        """Learn the completed interval and apply the next battery target."""
+        """Account for the completed interval, learn it, and apply the next target."""
+        await self._async_monitor_battery_energy(now)
         await self._async_update_consumption_profile(now)
         await self._async_apply_scheduled_power(now)
 
@@ -234,9 +228,22 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         await self._async_set_battery_power_target(target_power)
 
     async def _async_monitor_battery_energy(self, now: datetime) -> None:
-        """Account for battery meter deltas at the current EPEX price each minute."""
+        """Close the previous quarter using its meter deltas and cached price."""
+        utc_now = now.astimezone(UTC)
+        interval_start = utc_now.replace(
+            minute=utc_now.minute // INTERVAL_MINUTES * INTERVAL_MINUTES,
+            second=0,
+            microsecond=0,
+        )
+        # Startup captures a baseline; repeated callbacks must not close it early.
+        if (
+            self._account_interval_start is not None
+            and interval_start <= self._account_interval_start
+        ):
+            return
         current_plan = self.data.plan if self.data else None
         planning_error = self.data.planning_error if self.data else None
+        monitoring_error = None
         previous_account = self._account
         data = self._read_data(current_plan, planning_error)
         try:
@@ -247,32 +254,65 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 raise ValueError("Missing cumulative battery charged or discharged energy")
 
             measured_energy_kwh = self._measured_stored_energy_kwh(data)
+            # Cache the new interval's price before the source drops old data
+            # (notably at midnight). A missing new price must not prevent closing
+            # the previous interval; retry its lookup at the next boundary.
+            try:
+                next_price_per_kwh = self._current_price_per_kwh(interval_start)
+            except (KeyError, TypeError, ValueError):
+                next_price_per_kwh = None
+
             if not self._account.initialized:
-                if measured_energy_kwh is None:
-                    raise ValueError("Missing SOC or usable capacity for accounting baseline")
                 self._account = self._account.initialize(
                     data.battery_charged_energy_kwh,
                     data.battery_discharged_energy_kwh,
-                    measured_energy_kwh,
-                    self._current_price_per_kwh(now),
-                )
-            elif self._account.has_positive_meter_delta(
-                data.battery_charged_energy_kwh, data.battery_discharged_energy_kwh
-            ):
-                self._account = self._account.record(
-                    data.battery_charged_energy_kwh,
-                    data.battery_discharged_energy_kwh,
-                    self._current_price_per_kwh(now),
-                    measured_energy_kwh,
+                    measured_energy_kwh or 0.0,
+                    next_price_per_kwh or 0.0,
                 )
             else:
-                self._account = self._account.record(
-                    data.battery_charged_energy_kwh,
-                    data.battery_discharged_energy_kwh,
-                    0.0,
-                    measured_energy_kwh,
+                # Keep lifetime totals on restart, but never price an unknown
+                # downtime delta as though it all occurred in a single quarter.
+                baseline = replace(
+                    self._account,
+                    previous_charged_energy_kwh=data.battery_charged_energy_kwh,
+                    previous_discharged_energy_kwh=data.battery_discharged_energy_kwh,
                 )
+                if self._account_interval_start is None:
+                    self._account = baseline
+                elif self._account_interval_start != interval_start - timedelta(
+                    minutes=INTERVAL_MINUTES
+                ):
+                    self._account = baseline
+                    monitoring_error = "Missed accounting boundary; meter baselines reset"
+                else:
+                    try:
+                        price_per_kwh = 0.0
+                        if self._account.has_positive_meter_delta(
+                            data.battery_charged_energy_kwh,
+                            data.battery_discharged_energy_kwh,
+                        ):
+                            price_per_kwh = self._account_interval_price_per_kwh
+                            if price_per_kwh is None:
+                                price_per_kwh = self._current_price_per_kwh(
+                                    self._account_interval_start
+                                )
+                        self._account = self._account.record(
+                            data.battery_charged_energy_kwh,
+                            data.battery_discharged_energy_kwh,
+                            price_per_kwh,
+                            measured_energy_kwh,
+                        )
+                    except (KeyError, TypeError, ValueError) as err:
+                        self._account = baseline
+                        monitoring_error = (
+                            f"Unable to price completed battery interval; "
+                            f"meter baselines reset: {err}"
+                        )
+            self._account_interval_start = interval_start
+            self._account_interval_price_per_kwh = next_price_per_kwh
         except (KeyError, TypeError, ValueError) as err:
+            self._account_interval_start = None
+            self._account_interval_price_per_kwh = None
             LOGGER.warning("Unable to update DynEnergy battery accounting: %s", err)
             self.async_set_updated_data(
                 self._read_data(current_plan, planning_error, str(err))
@@ -281,13 +321,14 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
         if self._account != previous_account:
             self._account_dirty = True
-        if (
-            self._account_dirty
-            and dt_util.as_local(now).minute % _ACCOUNT_SAVE_INTERVAL_MINUTES == 0
-        ):
+        if self._account_dirty:
             await self._account_store.async_save(self._account.as_dict())
             self._account_dirty = False
-        self.async_set_updated_data(self._read_data(current_plan, planning_error))
+        if monitoring_error:
+            LOGGER.warning("Unable to update DynEnergy battery accounting: %s", monitoring_error)
+        self.async_set_updated_data(
+            self._read_data(current_plan, planning_error, monitoring_error)
+        )
 
     @staticmethod
     def _measured_stored_energy_kwh(data: DynEnergyData) -> float | None:
@@ -538,7 +579,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 price_per_kwh = float(raw_interval["price_per_kwh"])
             except (KeyError, TypeError, ValueError) as err:
                 raise ValueError("EPEX data has an invalid price interval") from err
-            if start <= local_now < end:
+            if start.timestamp() <= local_now.timestamp() < end.timestamp():
                 return price_per_kwh
 
         raise ValueError("No EPEX price available for the current interval")
