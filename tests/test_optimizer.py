@@ -1,5 +1,6 @@
 """Regression tests for DynEnergy optimizer output conversions."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -20,45 +21,42 @@ from custom_components.dynenergy.optimizer import (
     calculate_price_thresholds,
     create_greedy_charge_plan,
     default_consumption_kwh,
-    interval_power_limit_kw,
+    interval_energy_limit_kwh,
     target_power_w,
 )
 
 
-def _interval(target_battery_power_kw: float) -> PlanInterval:
+def _interval(target_battery_energy_kwh: float) -> PlanInterval:
     state = (
         OperatingState.CHARGE
-        if target_battery_power_kw < 0
+        if target_battery_energy_kwh < 0
         else OperatingState.DISCHARGE
-        if target_battery_power_kw > 0
+        if target_battery_energy_kwh > 0
         else OperatingState.IDLE
     )
     return PlanInterval(
         timestamp=datetime(2026, 9, 9, tzinfo=UTC),
         price_per_kwh=0.05,
         consumption_kwh=0.2,
-        target_battery_power_kw=target_battery_power_kw,
+        target_battery_energy_kwh=target_battery_energy_kwh,
         expected_soc_percent=50.0,
         state=state,
     )
 
 
-def test_hourly_limit_is_scaled_before_interval_output() -> None:
-    """A 1.5 kW hourly limit remains 1500 W through interval scaling."""
-    interval_limit_kw = interval_power_limit_kw(1.5)
+def test_power_limit_becomes_interval_energy() -> None:
+    """A 1.5 kW limit permits 0.375 kWh in a quarter hour."""
+    interval_limit_kwh = interval_energy_limit_kwh(1.5)
 
-    assert interval_limit_kw == 0.375
-    assert target_power_w(_interval(interval_limit_kw)) == 1500
-
-
-def test_target_power_preserves_charge_sign() -> None:
-    """Signed charging recommendations remain signed after conversion."""
-    assert target_power_w(_interval(-0.375)) == -1500
+    assert interval_limit_kwh == 0.375
+    assert target_power_w(_interval(interval_limit_kwh)) == 1500
 
 
-def test_missing_power_limit_remains_missing() -> None:
-    """An unavailable configured limit is not converted into a numeric value."""
-    assert interval_power_limit_kw(None) is None
+@pytest.mark.parametrize("energy_kwh, power_w", [(0.060, 240), (0.375, 1500)])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_target_power_converts_interval_energy_once(energy_kwh, power_w, sign) -> None:
+    """Both charge and discharge retain their sign during the kWh-to-W conversion."""
+    assert target_power_w(_interval(sign * energy_kwh)) == sign * power_w
 
 
 def test_default_weekly_consumption_profile() -> None:
@@ -206,11 +204,203 @@ def _inputs(
 
 
 def _charge_power_kw(interval: PlanInterval) -> float:
-    return round(-interval.target_battery_power_kw, 9)
+    return round(-interval.target_battery_energy_kwh / INTERVAL_HOURS, 9)
 
 
 def _discharge_kwh(interval: PlanInterval) -> float:
-    return round(interval.target_battery_power_kw * INTERVAL_HOURS, 9)
+    return round(interval.target_battery_energy_kwh, 9)
+
+
+def _small_battery(**overrides: float) -> BatteryParameters:
+    return _battery(
+        **{
+            "usable_capacity_kwh": 2.0,
+            "max_charge_power_kw": 1.5,
+            "max_discharge_power_kw": 1.5,
+            **overrides,
+        }
+    )
+
+
+def test_generated_plan_obeys_power_limits_and_uses_energy_for_soc() -> None:
+    """The real allocation/build/output path keeps 0.375 kWh at 1500 W."""
+    battery = _small_battery(charge_efficiency=0.9, discharge_efficiency=0.8)
+    plan = create_greedy_charge_plan(
+        _inputs([0.05, 0.30], current_soc_percent=50, battery=battery),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+    charge, discharge = plan.intervals
+
+    assert charge.target_battery_energy_kwh == pytest.approx(-0.375)
+    assert discharge.target_battery_energy_kwh == pytest.approx(0.375)
+    assert [target_power_w(interval) for interval in plan.intervals] == [-1500, 1500]
+    assert charge.expected_soc_percent == pytest.approx((1.0 + 0.375 * 0.9) / 2 * 100)
+    assert discharge.expected_soc_percent == pytest.approx(
+        (1.0 + 0.375 * 0.9 - 0.375 / 0.8) / 2 * 100
+    )
+    assert plan.summary.total_charge_kwh == pytest.approx(0.375)
+    assert plan.summary.total_discharge_kwh == pytest.approx(0.375)
+
+
+def test_forecast_interval_energy_produces_240_w_discharge() -> None:
+    """A 60 Wh load forecast means 240 W, including through _build_intervals."""
+    inputs = replace(
+        _inputs([0.30], current_soc_percent=50, battery=_small_battery()),
+        consumption_kwh=[0.060],
+    )
+    interval = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH).intervals[0]
+
+    assert interval.target_battery_energy_kwh == pytest.approx(0.060)
+    assert target_power_w(interval) == 240
+    assert interval.expected_soc_percent == pytest.approx(47.0)
+
+
+def test_sufficient_cheapest_bucket_excludes_all_more_expensive_slots() -> None:
+    """Bucket membership is fixed, even when its prices differ and slots alternate."""
+    prices = [0.045, 0.0, 0.019, 0.009, 0.045, 0.001, 0.01, 0.005] * 3 + [0.30]
+    plan = create_greedy_charge_plan(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+    required_kwh = 2.0 * (1 - 0.19) + 0.20 * 2.0
+
+    for interval in plan.intervals[:-1]:
+        if 0 <= interval.price_per_kwh < 0.01:
+            assert interval.target_battery_energy_kwh == pytest.approx(-required_kwh / 12)
+            assert -1500 < target_power_w(interval) < 0
+        else:
+            assert interval.state is OperatingState.IDLE
+    assert plan.intervals[-2].expected_soc_percent == pytest.approx(100)
+    assert plan.summary.total_charge_kwh == pytest.approx(1.62)
+
+
+def test_insufficient_cheapest_bucket_is_full_before_next_bucket() -> None:
+    """Only the remainder, including the margin, is spread into the 1-cent band."""
+    prices = [0.019, 0.0, 0.01, 0.009, 0.015, 0.01, 0.045, 0.30]
+    plan = create_greedy_charge_plan(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+    remainder_kwh = 2.02 - 2 * 0.375
+
+    for interval in plan.intervals[:-1]:
+        if interval.price_per_kwh < 0.01:
+            assert interval.target_battery_energy_kwh == pytest.approx(-0.375)
+            assert target_power_w(interval) == -1500
+        elif interval.price_per_kwh < 0.02:
+            assert interval.target_battery_energy_kwh == pytest.approx(-remainder_kwh / 4)
+        else:
+            assert interval.state is OperatingState.IDLE
+
+
+@pytest.mark.parametrize("negative_slots", [2, 8])
+def test_negative_price_bucket_precedes_zero_cent_bucket(negative_slots) -> None:
+    """Negative prices keep a separate, cheaper band even immediately below zero."""
+    prices = [0.0, 0.009] * 4 + [-0.000001] * negative_slots + [0.01] * 4 + [0.30]
+    plan = create_greedy_charge_plan(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+    negative_kwh = min(2.02, negative_slots * 0.375)
+    for interval in plan.intervals[:-1]:
+        if interval.price_per_kwh < 0:
+            expected_kwh = negative_kwh / negative_slots
+        elif interval.price_per_kwh < 0.01:
+            expected_kwh = (2.02 - negative_kwh) / 8
+        else:
+            expected_kwh = 0.0
+        assert interval.target_battery_energy_kwh == pytest.approx(-expected_kwh)
+
+
+@pytest.mark.parametrize("charge_efficiency", [1.0, 0.95])
+def test_earlier_expensive_block_waits_for_sufficient_cheaper_bucket(charge_efficiency) -> None:
+    """The 2 kWh / 19% SOC acceptance case buys only in the later 0-cent band."""
+    prices = [0.045] * 8 + [0.10] * 4 + [0.001, 0.009] * 6 + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery(
+            charge_efficiency=charge_efficiency,
+        )),
+        consumption_kwh=[0.0] * len(prices),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    required_kwh = 2.02 / charge_efficiency
+
+    assert all(interval.state is OperatingState.IDLE for interval in plan.intervals[:12])
+    assert all(
+        interval.target_battery_energy_kwh == pytest.approx(-required_kwh / 12)
+        for interval in plan.intervals[12:24]
+    )
+    assert all(abs(target_power_w(interval)) <= 1500 for interval in plan.intervals)
+    assert plan.intervals[23].expected_soc_percent == pytest.approx(100)
+    assert plan.summary.total_charge_kwh == pytest.approx(1.62 / charge_efficiency)
+
+
+def test_lookahead_crosses_more_than_one_later_block() -> None:
+    """An insufficient intermediate dip does not hide the later sufficient bucket."""
+    prices = [0.045] * 8 + [0.10] + [0.025] + [0.10] + [0.005] * 8 + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        consumption_kwh=[0.0] * len(prices),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert all(interval.state is OperatingState.IDLE for interval in plan.intervals[:11])
+    assert all(
+        interval.target_battery_energy_kwh == pytest.approx(-2.02 / 8)
+        for interval in plan.intervals[11:19]
+    )
+
+
+@pytest.mark.parametrize("gap_consumption_kwh, defer", [(0.060, True), (0.30, False)])
+def test_lookahead_preserves_discharge_before_the_cheaper_block(gap_consumption_kwh, defer) -> None:
+    """Opening energy can cover a small gap; a larger profitable load needs a cycle."""
+    prices = [0.045] * 8 + [0.15] + [0.005] * 8 + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery(
+            discharge_efficiency=0.8,
+        )),
+        consumption_kwh=[0.0] * 8 + [gap_consumption_kwh] + [0.0] * 8 + [0.375],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert any(i.state is OperatingState.CHARGE for i in plan.intervals[:8]) is not defer
+    assert plan.intervals[8].target_battery_energy_kwh == pytest.approx(gap_consumption_kwh)
+    assert all(i.state is OperatingState.CHARGE for i in plan.intervals[9:17])
+    assert plan.intervals[-1].state is OperatingState.DISCHARGE
+    assert all(10 <= i.expected_soc_percent <= 100 for i in plan.intervals)
+    assert all(abs(target_power_w(i)) <= 1500 for i in plan.intervals)
+    if defer:
+        required_kwh = 2.02 + gap_consumption_kwh / 0.8
+        assert all(
+            i.target_battery_energy_kwh == pytest.approx(-required_kwh / 8)
+            for i in plan.intervals[9:17]
+        )
+
+
+def test_lookahead_keeps_earlier_energy_for_spike_with_no_forecast_load() -> None:
+    """The look-ahead must use the spike override as well as ordinary demand."""
+    prices = [0.045] * 8 + [0.40] + [0.005] * 8 + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        consumption_kwh=[0.0] * len(prices),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert any(i.state is OperatingState.CHARGE for i in plan.intervals[:8])
+    assert target_power_w(plan.intervals[8]) == 1500
+
+
+def test_later_bucket_must_also_have_capacity_for_charge_margin() -> None:
+    """Five cheap slots can cover the 1.62 kWh deficit, but not the 2.02 kWh request."""
+    prices = [0.045] * 8 + [0.10] + [0.005] * 5 + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery()),
+        consumption_kwh=[0.0] * len(prices),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert all(i.state is OperatingState.CHARGE for i in plan.intervals[:8])
+    assert plan.intervals[7].expected_soc_percent == pytest.approx(100)
 
 
 def test_solar_day_runs_two_charge_and_discharge_cycles() -> None:
@@ -284,7 +474,7 @@ def test_charge_plan_books_a_slow_charging_margin() -> None:
         _inputs(_solar_day_prices(), battery=battery), CHARGE_THRESHOLD_PER_KWH
     )
     commanded_kwh = sum(
-        -interval.target_battery_power_kw * INTERVAL_HOURS
+        -interval.target_battery_energy_kwh
         for interval in plan.intervals[_NIGHT]
     )
     minimum_energy_kwh = CAPACITY_KWH * MIN_SOC_PERCENT / 100

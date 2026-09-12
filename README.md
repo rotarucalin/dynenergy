@@ -119,12 +119,26 @@ it: when that block can refill the battery on its own the gap may empty it down
 to minimum SOC, otherwise energy is held back for $T_{pre}$. The final gap, with
 no block after it, uses $T_{post}$.
 
-Within a block, intervals are grouped into 1 ct/kWh buckets and taken cheapest
+Before charging a block, DynEnergy checks later cheaper buckets. It skips the
+earlier block when a later bucket can cover the remaining deficit plus margin
+and postponing the charge preserves every intervening discharge allocation.
+This keeps earlier charging when its energy is needed for a morning peak while
+allowing an unnecessary early purchase to wait for cheaper prices.
+
+Within a block, intervals are grouped into fixed 1 ct/kWh buckets and taken cheapest
 first. A bucket that can supply everything still needed carries an equal share
 in each of its intervals; a bucket that cannot runs at full power and the
 remainder descends to the next bucket up. The request is 20% of usable capacity
 larger than the deficit, so a battery charging more slowly than commanded still
 reaches its target. That margin is commanded but never counted as absorbed.
+Negative-price buckets precede the 0–1 ct/kWh bucket.
+
+Internal allocations and consumption forecasts are kWh per 15-minute interval.
+Configured power limits remain in kW: a 1.5 kW limit permits 0.375 kWh per slot.
+The signed interval allocation is converted to watts once at the Home Assistant
+output boundary: 0.060 kWh becomes 240 W and 0.375 kWh becomes 1500 W. Charging
+commands are negative; discharge commands are positive. Expected SOC follows
+absorbed and delivered interval energy with the configured efficiencies.
 
 Discharge is normally limited to the forecast demand of the interval. When a
 price climbs more than 30 ct/kWh above the cost basis of the stored energy, the

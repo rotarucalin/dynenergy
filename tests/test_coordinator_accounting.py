@@ -1,4 +1,4 @@
-"""Exercise quarter-hour accounting with lightweight Home Assistant stand-ins."""
+"""Exercise coordinator planning and accounting with Home Assistant stand-ins."""
 
 import importlib.util
 from datetime import UTC, datetime, timedelta
@@ -71,6 +71,67 @@ def _load_coordinator():
 
 
 coordinator_module = _load_coordinator()
+
+
+class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_limits_keep_kw_through_planning_and_helper_output(self):
+        """Real HA readings, SOC prediction and helper writes share one unit path."""
+        start = datetime(2026, 9, 14, 8, tzinfo=UTC)
+        prices = [0.05, 0.40]
+        states = {
+            "sensor.price": SimpleNamespace(state="0.05", attributes={"data": [
+                {
+                    "start_time": (start + timedelta(minutes=15 * index)).isoformat(),
+                    "end_time": (start + timedelta(minutes=15 * (index + 1))).isoformat(),
+                    "price_per_kwh": price,
+                }
+                for index, price in enumerate(prices)
+            ]}),
+        }
+        config = {
+            "price_entity": "sensor.price",
+            "min_soc_percent": 10,
+            "max_soc_percent": 100,
+            "charge_efficiency": 0.9,
+            "discharge_efficiency": 0.8,
+            "charge_power_target_entity": "input_number.target",
+        }
+        for key, value, unit in [
+            ("soc_entity", "50", "%"),
+            ("capacity_entity", "2", "kWh"),
+            ("max_charge_power_entity", "1500", "W"),
+            ("max_discharge_power_entity", "1.5", "kW"),
+        ]:
+            config[key] = f"sensor.{key}"
+            states[config[key]] = SimpleNamespace(
+                state=value, attributes={"unit_of_measurement": unit}
+            )
+        hass = SimpleNamespace(
+            states=SimpleNamespace(get=states.get),
+            services=SimpleNamespace(async_call=AsyncMock()),
+        )
+        entry = SimpleNamespace(entry_id="test", data=config)
+        coordinator = coordinator_module.DynEnergyCoordinator(hass, entry)
+        data = coordinator._read_data()
+
+        self.assertEqual(data.max_charge_power_kw, 1.5)
+        self.assertEqual(data.max_discharge_power_kw, 1.5)
+        plan = coordinator._create_charge_plan(data, start.date())
+        self.assertAlmostEqual(plan.intervals[0].expected_soc_percent, 66.875)
+        self.assertAlmostEqual(plan.intervals[1].expected_soc_percent, 43.4375)
+        coordinator.data = coordinator._read_data(plan=plan)
+        for index, expected_watts in enumerate([-1500, 1500]):
+            await coordinator._async_apply_scheduled_power(
+                start + timedelta(minutes=15 * index)
+            )
+            hass.services.async_call.assert_awaited_with(
+                "input_number", "set_value",
+                {"entity_id": "input_number.target", "value": expected_watts},
+                blocking=True,
+            )
+
+        states[config["max_charge_power_entity"]].state = "unavailable"
+        self.assertIsNone(coordinator._read_data().max_charge_power_kw)
 
 
 class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
