@@ -1,5 +1,6 @@
 """Exercise coordinator planning and accounting with Home Assistant stand-ins."""
 
+import asyncio
 import importlib.util
 from datetime import UTC, datetime, timedelta
 from math import isclose
@@ -31,6 +32,9 @@ def _load_coordinator():
 
         def async_set_updated_data(self, data):
             self.data = data
+
+        async def async_shutdown(self):
+            pass
 
     def module(name, **attributes):
         result = ModuleType(name)
@@ -212,6 +216,219 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
 
         states[config["max_charge_power_entity"]].state = "unavailable"
         self.assertIsNone(coordinator._read_data().max_charge_power_kw)
+
+
+class StartupPlanningTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.start = datetime(2026, 9, 14, tzinfo=UTC)
+        self.now = self.start + timedelta(minutes=14)
+        self.price_rows = [
+            {
+                "start_time": (self.start + offset).isoformat(),
+                "end_time": (self.start + offset + timedelta(minutes=15)).isoformat(),
+                "price_per_kwh": 0.20,
+            }
+            for offset in [
+                timedelta(days=day, minutes=minute)
+                for day in (0, 1) for minute in (0, 15, 30)
+            ]
+        ]
+        self.states = {
+            "sensor.price": SimpleNamespace(
+                state="0.20", attributes={"data": self.price_rows}
+            ),
+        }
+        self.config = {
+            "price_entity": "sensor.price",
+            "min_soc_percent": 10,
+            "max_soc_percent": 100,
+            "charge_efficiency": 1.0,
+            "discharge_efficiency": 1.0,
+            "charge_power_target_entity": "input_number.target",
+        }
+        for key, value, unit in [
+            ("soc_entity", "50", "%"),
+            ("capacity_entity", "2", "kWh"),
+            ("max_charge_power_entity", "1500", "W"),
+            ("max_discharge_power_entity", "1500", "W"),
+            ("battery_charged_energy_entity", "0", "kWh"),
+            ("battery_discharged_energy_entity", "0", "kWh"),
+        ]:
+            self.config[key] = f"sensor.{key}"
+            self.states[self.config[key]] = SimpleNamespace(
+                state=value, attributes={"unit_of_measurement": unit}
+            )
+        self.hass = SimpleNamespace(
+            states=SimpleNamespace(get=self.states.get),
+            services=SimpleNamespace(async_call=AsyncMock()),
+        )
+        entry = SimpleNamespace(entry_id="test", data=self.config)
+        self.coordinator = coordinator_module.DynEnergyCoordinator(self.hass, entry)
+        for name in ("_account_store", "_consumption_profile_store"):
+            setattr(self.coordinator, name, SimpleNamespace(
+                async_load=AsyncMock(return_value=None), async_save=AsyncMock()
+            ))
+        self.cancel_retry = Mock()
+        self.track = self.enterContext(patch.object(
+            coordinator_module, "async_track_time_change",
+            side_effect=[Mock(), Mock(), self.cancel_retry],
+        ))
+        self.enterContext(patch.object(
+            coordinator_module.dt_util, "now", side_effect=lambda: self.now
+        ))
+        self.create_plan = self.enterContext(patch.object(
+            self.coordinator, "_create_charge_plan",
+            wraps=self.coordinator._create_charge_plan,
+        ))
+
+    def set_state(self, key, value):
+        self.states[self.config[key]].state = value
+
+    async def start_waiting_for_soc(self):
+        self.set_state("soc_entity", "unavailable")
+        await self.coordinator.async_start()
+        self.create_plan.assert_not_called()
+        self.assertIsNone(self.coordinator.data.planning_error)
+        self.assertEqual(self.track.call_count, 3)
+        registration = self.track.call_args
+        self.assertEqual(list(registration.kwargs["second"]), list(range(0, 60, 5)))
+        return registration.args[1]
+
+    async def test_delayed_soc_plans_once_and_immediately_applies_current_target(self):
+        retry = await self.start_waiting_for_soc()
+        for minutes in (1, 2, 3):
+            self.now = self.start + timedelta(minutes=14 + minutes)
+            await retry(self.now)
+            self.create_plan.assert_not_called()
+        self.assertEqual(self.track.call_count, 3)
+        self.set_state("soc_entity", "50")
+        await retry(self.now)
+
+        self.create_plan.assert_called_once()
+        self.cancel_retry.assert_called_once_with()
+        self.assertIsNone(self.coordinator._unsub_startup_retry)
+        self.assertEqual(
+            self.coordinator.data.plan.intervals[0].timestamp,
+            self.start + timedelta(minutes=15),
+        )
+        self.hass.services.async_call.assert_awaited_with(
+            "input_number", "set_value",
+            {"entity_id": "input_number.target", "value": 240}, blocking=True,
+        )
+        await retry(self.now)  # A previously queued callback must not plan again.
+        self.create_plan.assert_called_once()
+
+    async def test_waits_for_all_required_numeric_inputs(self):
+        keys = ["soc_entity", "capacity_entity", "max_charge_power_entity",
+                "max_discharge_power_entity"]
+        values = [self.states[self.config[key]].state for key in keys]
+        for key in keys:
+            self.set_state(key, "unknown")
+        retry = await self.start_waiting_for_soc()
+        for key, value in zip(keys, values, strict=True):
+            self.create_plan.assert_not_called()
+            self.set_state(key, value)
+            await retry(self.now)
+        self.create_plan.assert_called_once()
+
+    async def test_unknown_missing_and_nonfinite_soc_are_not_ready(self):
+        retry = await self.start_waiting_for_soc()
+        for value in ("unknown", "nan", "inf", "-inf", None):
+            self.set_state("soc_entity", value)
+            await retry(self.now)
+            self.create_plan.assert_not_called()
+        state = self.states.pop(self.config["soc_entity"])
+        await retry(self.now)
+        self.create_plan.assert_not_called()
+        state.state = "50"
+        self.states[self.config["soc_entity"]] = state
+        await retry(self.now)
+        self.create_plan.assert_called_once()
+
+    async def test_waits_for_prices_for_the_requested_day(self):
+        price_state = self.states["sensor.price"]
+        price_state.attributes = {}
+        await self.coordinator.async_start()
+        retry = self.track.call_args.args[1]
+        for rows in ([], self.price_rows[3:]):
+            price_state.attributes = {"data": rows}
+            await retry(self.now)
+            self.create_plan.assert_not_called()
+        price_state.attributes = {"data": self.price_rows}
+        await retry(self.now)
+        self.create_plan.assert_called_once()
+        self.cancel_retry.assert_called_once_with()
+
+    async def test_ready_inputs_plan_immediately_without_a_retry_timer(self):
+        # Accounting meters are not required inputs to the optimizer.
+        self.set_state("battery_charged_energy_entity", "unavailable")
+        self.set_state("battery_discharged_energy_entity", "unavailable")
+        await self.coordinator.async_start()
+        self.create_plan.assert_called_once()
+        self.assertEqual(self.track.call_count, 2)
+        self.assertIsNone(self.coordinator._unsub_startup_retry)
+
+    async def test_transient_refresh_failure_keeps_retrying_until_success(self):
+        async def fail_refresh(domain, service, data, **kwargs):
+            if domain == "homeassistant":
+                raise coordinator_module.HomeAssistantError("EPEX is starting")
+
+        self.hass.services.async_call.side_effect = fail_refresh
+        await self.coordinator.async_start()
+        self.create_plan.assert_not_called()
+        self.assertIn("EPEX is starting", self.coordinator.data.planning_error)
+        retry = self.track.call_args.args[1]
+        self.hass.services.async_call.side_effect = None
+        await retry(self.now)
+        self.create_plan.assert_called_once()
+        self.cancel_retry.assert_called_once_with()
+        self.assertIsNone(self.coordinator.data.planning_error)
+
+    async def test_retry_recomputes_the_target_day_after_midnight(self):
+        self.now = self.start + timedelta(hours=23, minutes=59)
+        retry = await self.start_waiting_for_soc()
+        self.now = self.start + timedelta(days=1, minutes=16)
+        self.set_state("soc_entity", "50")
+        await retry(self.now)
+        self.create_plan.assert_called_once()
+        self.assertEqual(
+            self.coordinator.data.plan.intervals[0].timestamp,
+            self.start + timedelta(days=1, minutes=15),
+        )
+
+    async def test_shutdown_cancels_waiting_and_ignores_a_queued_retry(self):
+        retry = await self.start_waiting_for_soc()
+        await self.coordinator.async_shutdown()
+        self.cancel_retry.assert_called_once_with()
+        self.set_state("soc_entity", "50")
+        await retry(self.now)
+        self.create_plan.assert_not_called()
+
+    async def test_overlapping_retry_and_shutdown_during_refresh_are_safe(self):
+        retry = await self.start_waiting_for_soc()
+        self.set_state("soc_entity", "50")
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def service_call(domain, service, data, **kwargs):
+            if domain == "homeassistant":
+                refresh_started.set()
+                await release_refresh.wait()
+
+        self.hass.services.async_call.side_effect = service_call
+        task = asyncio.create_task(retry(self.now))
+        try:
+            await refresh_started.wait()
+            await retry(self.now)
+            self.assertEqual(self.hass.services.async_call.await_count, 2)
+            await self.coordinator.async_shutdown()
+        finally:
+            release_refresh.set()
+            await task
+        self.create_plan.assert_not_called()
+        self.cancel_retry.assert_called_once_with()
+        self.assertIsNone(self.coordinator._unsub_startup_retry)
+        self.assertIsNone(self.coordinator.data.plan)
 
 
 class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):

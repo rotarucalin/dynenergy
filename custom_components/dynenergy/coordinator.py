@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 import logging
+from math import isfinite
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -103,6 +104,9 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self.entry = entry
         self._unsub_plan: Callable[[], None] | None = None
         self._unsub_apply: Callable[[], None] | None = None
+        self._unsub_startup_retry: Callable[[], None] | None = None
+        self._startup_planning = False
+        self._shutting_down = False
         self._last_target_power_w: int | None = None
         self._account = BatteryCostAccount()
         self._account_dirty = False
@@ -147,6 +151,8 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def async_shutdown(self) -> None:
         """Stop scheduled callbacks and leave the charge target idle."""
+        self._shutting_down = True
+        self._cancel_startup_retry()
         for unsubscribe in (self._unsub_plan, self._unsub_apply):
             if unsubscribe:
                 unsubscribe()
@@ -176,12 +182,54 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         await self._async_refresh_plan(dt_util.as_local(now).date() + timedelta(days=1))
 
     async def _async_restore_plan(self) -> None:
-        """Plan the remainder of today so a restart does not leave the battery idle."""
-        local_now = dt_util.now()
-        if (local_now.hour, local_now.minute) >= (PLAN_HOUR, PLAN_MINUTE):
-            await self._async_refresh_plan(local_now.date() + timedelta(days=1))
+        """Restore a plan once its inputs are ready, without blocking startup."""
+        if self._startup_planning or self._shutting_down:
             return
-        await self._async_refresh_plan(local_now.date(), not_before=local_now)
+        self._startup_planning = True
+        try:
+            local_now = dt_util.now()
+            target_date = local_now.date()
+            not_before = local_now
+            if (local_now.hour, local_now.minute) >= (PLAN_HOUR, PLAN_MINUTE):
+                target_date += timedelta(days=1)
+                not_before = None
+            try:
+                self._validate_plan_inputs(self._read_data())
+                self._target_day_prices(target_date, not_before)
+            except (KeyError, TypeError, ValueError) as err:
+                LOGGER.debug("Waiting for DynEnergy startup inputs: %s", err)
+                self._schedule_startup_retry()
+                return
+
+            await self._async_refresh_plan(target_date, not_before)
+            if not self._shutting_down and (not self.data or not self.data.plan):
+                self._schedule_startup_retry()
+        finally:
+            self._startup_planning = False
+
+    def _schedule_startup_retry(self) -> None:
+        """Check delayed source entities every five seconds until planning succeeds."""
+        if self._unsub_startup_retry is None and not self._shutting_down:
+            self._unsub_startup_retry = async_track_time_change(
+                self.hass, self._async_retry_startup_plan, second=range(0, 60, 5)
+            )
+
+    def _cancel_startup_retry(self) -> None:
+        """Remove the temporary readiness check after planning or unloading."""
+        if self._unsub_startup_retry is not None:
+            self._unsub_startup_retry()
+            self._unsub_startup_retry = None
+
+    async def _async_retry_startup_plan(self, now: datetime) -> None:
+        """Generate and apply the current startup plan as soon as inputs recover."""
+        if self._startup_planning or self._shutting_down:
+            return
+        if self.data and self.data.plan:
+            self._cancel_startup_retry()
+            return
+        await self._async_restore_plan()
+        if not self._shutting_down and self.data and self.data.plan:
+            await self._async_apply_scheduled_power(dt_util.now())
 
     async def _async_refresh_plan(
         self, target_date: date, not_before: datetime | None = None
@@ -195,6 +243,8 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 {"entity_id": self.entry.data[CONF_PRICE_ENTITY]},
                 blocking=True,
             )
+            if self._shutting_down:
+                return
             data = self._read_data()
             plan = self._create_charge_plan(data, target_date, not_before)
         except (HomeAssistantError, KeyError, TypeError, ValueError) as err:
@@ -210,6 +260,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self.async_set_updated_data(
             self._read_data(plan=plan, monitoring_error=monitoring_error)
         )
+        self._cancel_startup_retry()
 
     async def _async_apply_scheduled_power(self, now: datetime) -> None:
         """Set the signed Watt helper for the current 15-minute plan interval."""
@@ -445,6 +496,22 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             monitoring_error=monitoring_error,
         )
 
+    @staticmethod
+    def _validate_plan_inputs(data: DynEnergyData) -> None:
+        """Require usable readings for every numeric optimizer input."""
+        required_values = {
+            "current SOC": data.current_soc_percent,
+            "usable capacity": data.usable_capacity_kwh,
+            "maximum charge power": data.max_charge_power_kw,
+            "maximum discharge power": data.max_discharge_power_kw,
+        }
+        missing = [
+            name for name, value in required_values.items()
+            if value is None or not isfinite(value)
+        ]
+        if missing:
+            raise ValueError(f"Missing numeric input: {', '.join(missing)}")
+
     def _create_charge_plan(
         self,
         data: DynEnergyData,
@@ -452,16 +519,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         not_before: datetime | None = None,
     ) -> OptimizationPlan:
         """Build the greedy charging plan from EPEX prices and helper values."""
-        required_values = {
-            "current SOC": data.current_soc_percent,
-            "usable capacity": data.usable_capacity_kwh,
-            "maximum charge power": data.max_charge_power_kw,
-            "maximum discharge power": data.max_discharge_power_kw,
-        }
-        missing = [name for name, value in required_values.items() if value is None]
-        if missing:
-            raise ValueError(f"Missing numeric input: {', '.join(missing)}")
-
+        self._validate_plan_inputs(data)
         timestamps, prices_per_kwh = self._target_day_prices(target_date, not_before)
         battery = BatteryParameters(
             usable_capacity_kwh=data.usable_capacity_kwh,

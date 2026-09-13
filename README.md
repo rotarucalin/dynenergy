@@ -64,8 +64,14 @@ realized EPEX savings when that energy is discharged.
    negative values as charging and positive values as discharging.
 3. Open **Settings > Devices & services > Add integration**, search for
    **DynEnergy**, and complete the configuration form.
-4. Wait for the 23:50 local planning run, then review the `Battery plan` sensor
+4. Wait for the startup plan, then review the `Battery plan` sensor
    before allowing the helper to control the battery.
+
+Startup planning waits for SoC, battery capacity, charge/discharge power limits,
+and the requested day's EPEX prices. While sources are unavailable, DynEnergy
+checks every five seconds without blocking integration setup. Once they are
+ready, it generates the plan and applies the current interval's target. Daily
+planning continues at 23:50 local time.
 
 Existing DynEnergy installations must use **Reconfigure** after upgrading to
 select the cumulative battery charged and discharged energy sensors.
@@ -264,7 +270,7 @@ disconnected from automatic control first.
 
 | Symptom | Check |
 |---|---|
-| `Battery plan` remains unavailable | Day-ahead planning runs at 23:50 local time. Confirm that the EPEX entity provides tomorrow's intervals and inspect `planning_error` in the sensor attributes. |
+| `Battery plan` remains unavailable | Startup waits for numeric SoC, capacity, power limits, and EPEX prices, checking every five seconds. Before 23:50 it needs today's remaining intervals; from 23:50 it needs tomorrow's. Inspect `planning_error` for other failures. |
 | Accounting sensors do not update | Confirm both battery energy counters are numeric cumulative kWh totals. Inspect `monitoring_error` on `Battery plan`. |
 | No target is applied | Confirm the writable entity is an `input_number`, has adequate negative and positive limits, and your battery automation reads it. |
 | Unexpected accounting total after a meter reset | A reduced counter value is intentionally used as a new baseline. The next positive increment will be accounted normally. |
