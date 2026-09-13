@@ -22,6 +22,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from . import optimizer
 from .const import (
     CONF_BATTERY_CHARGED_ENERGY_ENTITY,
     CONF_BATTERY_DISCHARGED_ENERGY_ENTITY,
@@ -45,16 +46,6 @@ from .const import (
     PLAN_MINUTE,
 )
 from .accounting import BatteryCostAccount
-from .optimizer import (
-    INTERVAL_HOURS,
-    INTERVAL_MINUTES,
-    BatteryParameters,
-    OptimizationPlan,
-    OptimizerInputs,
-    WeeklyConsumptionProfile,
-    create_greedy_charge_plan,
-    target_power_w,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -85,8 +76,8 @@ class DynEnergyData:
     max_discharge_power_kw: float | None
     grid_import_energy_kwh: float | None
     account: BatteryCostAccount
-    consumption_profile: WeeklyConsumptionProfile
-    plan: OptimizationPlan | None = None
+    consumption_profile: optimizer.WeeklyConsumptionProfile
+    plan: optimizer.OptimizationPlan | None = None
     planning_error: str | None = None
     monitoring_error: str | None = None
 
@@ -115,7 +106,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self._account_store: Store[dict[str, object]] = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.account"
         )
-        self._consumption_profile = WeeklyConsumptionProfile.default()
+        self._consumption_profile = optimizer.WeeklyConsumptionProfile.default()
         self._consumption_profile_store: Store[dict[str, object]] = Store(
             hass, 1, f"{DOMAIN}.{entry.entry_id}.consumption_profile"
         )
@@ -127,7 +118,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self._account = BatteryCostAccount.from_dict(
             await self._account_store.async_load()
         )
-        self._consumption_profile = WeeklyConsumptionProfile.from_dict(
+        self._consumption_profile = optimizer.WeeklyConsumptionProfile.from_dict(
             await self._consumption_profile_store.async_load()
         )
         self._unsub_plan = async_track_time_change(
@@ -166,7 +157,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def _async_run_interval_tasks(self, now: datetime) -> None:
         """Account for the completed interval, learn it, and apply the next target."""
+        if self._shutting_down:
+            return
         await self._async_monitor_battery_energy(now)
+        if self._shutting_down:
+            return
         await self._async_update_consumption_profile(now)
         await self._async_apply_scheduled_power(now)
 
@@ -235,6 +230,8 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         self, target_date: date, not_before: datetime | None = None
     ) -> None:
         """Refresh EPEX data and replace the active plan for the target date."""
+        if self._shutting_down:
+            return
         monitoring_error = self.data.monitoring_error if self.data else None
         try:
             await self.hass.services.async_call(
@@ -264,15 +261,17 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def _async_apply_scheduled_power(self, now: datetime) -> None:
         """Set the signed Watt helper for the current 15-minute plan interval."""
+        if self._shutting_down:
+            return
         target_power = 0
         plan = self.data.plan if self.data else None
         if plan:
             local_now = dt_util.as_local(now)
             for interval in plan.intervals:
                 if interval.timestamp <= local_now < interval.timestamp + timedelta(
-                    hours=INTERVAL_HOURS
+                    hours=optimizer.INTERVAL_HOURS
                 ):
-                    target_power = target_power_w(interval)
+                    target_power = optimizer.target_power_w(interval)
                     break
 
         await self._async_set_battery_power_target(target_power)
@@ -281,7 +280,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         """Close the previous quarter using its meter deltas and cached price."""
         utc_now = now.astimezone(UTC)
         interval_start = utc_now.replace(
-            minute=utc_now.minute // INTERVAL_MINUTES * INTERVAL_MINUTES,
+            minute=utc_now.minute // optimizer.INTERVAL_MINUTES * optimizer.INTERVAL_MINUTES,
             second=0,
             microsecond=0,
         )
@@ -330,7 +329,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 if self._account_interval_start is None:
                     self._account = baseline
                 elif self._account_interval_start != interval_start - timedelta(
-                    minutes=INTERVAL_MINUTES
+                    minutes=optimizer.INTERVAL_MINUTES
                 ):
                     self._account = baseline
                     monitoring_error = "Missed accounting boundary; meter baselines reset"
@@ -408,9 +407,9 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             previous_at is not None
             and previous_at.second == 0
             and previous_at.microsecond == 0
-            and previous_at.minute % INTERVAL_MINUTES == 0
+            and previous_at.minute % optimizer.INTERVAL_MINUTES == 0
             and local_now.timestamp() - previous_at.timestamp()
-            == INTERVAL_MINUTES * 60
+            == optimizer.INTERVAL_MINUTES * 60
         )
 
         if (
@@ -456,7 +455,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     def _read_data(
         self,
-        plan: OptimizationPlan | None = None,
+        plan: optimizer.OptimizationPlan | None = None,
         planning_error: str | None = None,
         monitoring_error: str | None = None,
     ) -> DynEnergyData:
@@ -517,11 +516,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
         data: DynEnergyData,
         target_date: date,
         not_before: datetime | None = None,
-    ) -> OptimizationPlan:
+    ) -> optimizer.OptimizationPlan:
         """Build the greedy charging plan from EPEX prices and helper values."""
         self._validate_plan_inputs(data)
         timestamps, prices_per_kwh = self._target_day_prices(target_date, not_before)
-        battery = BatteryParameters(
+        battery = optimizer.BatteryParameters(
             usable_capacity_kwh=data.usable_capacity_kwh,
             max_charge_power_kw=data.max_charge_power_kw,
             max_discharge_power_kw=data.max_discharge_power_kw,
@@ -533,7 +532,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 self.entry.data.get(CONF_DEGRADATION_COST, 0.0)
             ),
         )
-        inputs = OptimizerInputs(
+        inputs = optimizer.OptimizerInputs(
             timestamps=timestamps,
             prices_per_kwh=prices_per_kwh,
             consumption_kwh=[
@@ -548,7 +547,7 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
                 else None
             ),
         )
-        return create_greedy_charge_plan(
+        return optimizer.create_greedy_charge_plan(
             inputs,
             float(
                 self.entry.data.get(

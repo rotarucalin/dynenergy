@@ -33,6 +33,9 @@ def _load_coordinator():
         def async_set_updated_data(self, data):
             self.data = data
 
+        async def async_config_entry_first_refresh(self):
+            self.async_set_updated_data(await self._async_update_data())
+
         async def async_shutdown(self):
             pass
 

@@ -288,6 +288,18 @@ disconnected from automatic control first.
 
 ## Development
 
+After installing the optimizer reload support, restart Home Assistant once to
+load the updated setup, coordinator, and sensor modules. Subsequent edits to
+`custom_components/dynenergy/optimizer.py` can be applied with **Reload** on the
+DynEnergy config entry under **Settings > Devices & services**.
+
+Entry setup reloads only the optimizer module, creates a fresh coordinator,
+restores the stored profile and accounting, and generates a startup plan before
+loading the sensors. If required inputs are still unavailable, the existing
+five-second readiness check applies. Unloading retains the safe 0 W target,
+so a reload can briefly interrupt battery operation. Changes outside
+`optimizer.py` still require a Home Assistant restart.
+
 Run the pure domain tests from the repository root:
 
 ```powershell

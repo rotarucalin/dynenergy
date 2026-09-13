@@ -14,14 +14,9 @@ from homeassistant.util import dt as dt_util
 
 from homeassistant.const import UnitOfPower
 
+from . import optimizer
 from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, DOMAIN
 from .coordinator import DynEnergyCoordinator
-from .optimizer import (
-    INTERVAL_HOURS,
-    INTERVALS_PER_DAY,
-    PlanInterval,
-    target_power_w,
-)
 
 _WEEKDAYS = (
     "monday",
@@ -107,18 +102,18 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             attributes["intervals"] = [
                 _interval_as_dict(interval)
                 for interval in data.plan.intervals
-                if interval.timestamp + timedelta(hours=INTERVAL_HOURS) > local_now
+                if interval.timestamp + timedelta(hours=optimizer.INTERVAL_HOURS) > local_now
             ]
         return attributes
 
 
-def _interval_as_dict(interval: PlanInterval) -> dict[str, object]:
+def _interval_as_dict(interval: optimizer.PlanInterval) -> dict[str, object]:
     """Render one plan interval for entity attributes."""
     return {
         "timestamp": interval.timestamp.isoformat(),
         "price_per_kwh": interval.price_per_kwh,
         "consumption_kwh": interval.consumption_kwh,
-        "target_battery_power_w": target_power_w(interval),
+        "target_battery_power_w": optimizer.target_power_w(interval),
         "expected_soc_percent": interval.expected_soc_percent,
         "state": interval.state.value,
     }
@@ -142,7 +137,7 @@ class DynEnergyPowerRecommendationSensor(
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_power_recommendation"
 
-    def _current_interval(self) -> PlanInterval | None:
+    def _current_interval(self) -> optimizer.PlanInterval | None:
         """Return the plan interval containing the current local time."""
         plan = self.coordinator.data.plan
         if not plan:
@@ -154,7 +149,7 @@ class DynEnergyPowerRecommendationSensor(
                 for interval in plan.intervals
                 if interval.timestamp
                 <= local_now
-                < interval.timestamp + timedelta(hours=INTERVAL_HOURS)
+                < interval.timestamp + timedelta(hours=optimizer.INTERVAL_HOURS)
             ),
             None,
         )
@@ -165,7 +160,7 @@ class DynEnergyPowerRecommendationSensor(
         interval = self._current_interval()
         if interval is None:
             return None if self.coordinator.data.plan is None else 0
-        return target_power_w(interval)
+        return optimizer.target_power_w(interval)
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
@@ -181,9 +176,9 @@ class DynEnergyPowerRecommendationSensor(
             "current_state": current.state.value if current else None,
             "plan_start": plan.intervals[0].timestamp.isoformat(),
             "plan_end": (
-                plan.intervals[-1].timestamp + timedelta(hours=INTERVAL_HOURS)
+                plan.intervals[-1].timestamp + timedelta(hours=optimizer.INTERVAL_HOURS)
             ).isoformat(),
-            "interval_minutes": int(INTERVAL_HOURS * 60),
+            "interval_minutes": int(optimizer.INTERVAL_HOURS * 60),
             "intervals": [_interval_as_dict(interval) for interval in plan.intervals],
         }
 
@@ -212,7 +207,7 @@ class DynEnergyTypicalConsumptionSensor(
         consumption_kwh = self.coordinator.data.consumption_profile.consumption_kwh(
             dt_util.now()
         )
-        return round(consumption_kwh / INTERVAL_HOURS * 1000)
+        return round(consumption_kwh / optimizer.INTERVAL_HOURS * 1000)
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
@@ -221,15 +216,15 @@ class DynEnergyTypicalConsumptionSensor(
         weekly_profile_w: dict[str, list[int]] = {}
         sample_counts: dict[str, list[int]] = {}
         for weekday, name in enumerate(_WEEKDAYS):
-            start = weekday * INTERVALS_PER_DAY
-            end = start + INTERVALS_PER_DAY
+            start = weekday * optimizer.INTERVALS_PER_DAY
+            end = start + optimizer.INTERVALS_PER_DAY
             weekly_profile_w[name] = [
-                round(value / INTERVAL_HOURS * 1000)
+                round(value / optimizer.INTERVAL_HOURS * 1000)
                 for value in profile.values_kwh[start:end]
             ]
             sample_counts[name] = list(profile.sample_counts[start:end])
         return {
-            "interval_minutes": int(INTERVAL_HOURS * 60),
+            "interval_minutes": int(optimizer.INTERVAL_HOURS * 60),
             "weekly_profile_w": weekly_profile_w,
             "sample_counts": sample_counts,
         }

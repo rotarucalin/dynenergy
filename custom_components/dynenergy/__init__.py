@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
 
+from . import optimizer
 from .const import DOMAIN, PLATFORMS
 
 if TYPE_CHECKING:
@@ -13,6 +15,9 @@ if TYPE_CHECKING:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up DynEnergy from a config entry."""
+    # HA caches integration modules across entry reloads. Refresh only this
+    # boundary, off the event loop, before creating any optimizer objects.
+    await hass.async_add_executor_job(importlib.reload, optimizer)
     from .coordinator import DynEnergyCoordinator
 
     coordinator = DynEnergyCoordinator(hass, entry)
