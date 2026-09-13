@@ -18,6 +18,8 @@ from custom_components.dynenergy.optimizer import (
     OptimizerInputs,
     PlanInterval,
     WeeklyConsumptionProfile,
+    _charge_blocks,
+    _charge_bucket_pools,
     calculate_price_thresholds,
     create_greedy_charge_plan,
     default_consumption_kwh,
@@ -339,6 +341,182 @@ def test_insufficient_cheapest_bucket_is_full_before_next_bucket() -> None:
             assert interval.target_battery_energy_kwh == pytest.approx(-remainder_kwh / 4)
         else:
             assert interval.state is OperatingState.IDLE
+
+
+@pytest.mark.parametrize("separation_minutes", [15, 30, 45, 60])
+def test_nearby_equal_bucket_occurrences_share_charging(separation_minutes) -> None:
+    """Different exact prices in bucket 9 share capacity through the one-hour edge."""
+    separators = separation_minutes // 15 - 1
+    prices = [0.0996] + [0.1015] * separators + [0.0928, 0.20]
+    inputs = _inputs(prices, current_soc_percent=95, battery=_small_battery())
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    later_index = separators + 1
+
+    # 0.1 kWh deficit + the unchanged 0.4 kWh margin, shared by two slots.
+    assert target_power_w(plan.intervals[0]) == -1000
+    assert target_power_w(plan.intervals[later_index]) == -1000
+    assert all(
+        interval.state is OperatingState.IDLE
+        for interval in plan.intervals[1:later_index]
+    )
+
+
+def test_four_nearby_bucket_nine_slots_share_one_kwh_command() -> None:
+    """The isolated first interval gets the same -1000 W as the later three."""
+    prices = [0.0996, 0.1015, 0.0972, 0.0945, 0.0928, 0.20]
+    inputs = _inputs(prices, current_soc_percent=70, battery=_small_battery())
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert _charge_blocks(inputs, 0.10) == [(0,), (2, 3, 4)]
+    assert [target_power_w(plan.intervals[i]) for i in (0, 2, 3, 4)] == [-1000] * 4
+    assert plan.intervals[1].state is OperatingState.IDLE
+    assert plan.intervals[4].expected_soc_percent == pytest.approx(100)
+
+
+@pytest.mark.parametrize("separation_minutes, expected_power", [(60, -1000), (75, 0)])
+def test_bucket_grouping_uses_timestamps_with_missing_intervals(
+    separation_minutes, expected_power
+) -> None:
+    """The same array shape groups at 60 minutes and stays independent at 75."""
+    inputs = replace(
+        _inputs([0.0996, 0.1015, 0.0928, 0.20], current_soc_percent=95,
+                battery=_small_battery()),
+        timestamps=[
+            DAY_START + timedelta(minutes=minute)
+            for minute in (0, 15, separation_minutes, separation_minutes + 15)
+        ],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert target_power_w(plan.intervals[2]) == expected_power
+    assert target_power_w(plan.intervals[0]) == (
+        -1000 if separation_minutes == 60 else -1500
+    )
+
+
+def test_nearby_different_bucket_keys_do_not_form_a_pool() -> None:
+    """9.96 and 10.02 cents remain distinct even in a hypothetical charge block."""
+    inputs = _inputs([0.0996, 0.20, 0.1002])
+    # The production 10-cent cap excludes 10.02 cents altogether; isolate the
+    # grouping rule here by supplying both opportunities as candidate blocks.
+    assert _charge_bucket_pools(inputs, [(0,), (2,)], 0) == ([(0,)], 0)
+
+    # Exercise two eligible, distinct keys through the real planner as well.
+    plan = create_greedy_charge_plan(
+        _inputs([0.0996, 0.1015, 0.0896, 0.20], current_soc_percent=95,
+                battery=_small_battery()),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+    assert target_power_w(plan.intervals[0]) == -1500
+    assert plan.intervals[2].state is OperatingState.IDLE
+
+
+@pytest.mark.parametrize("last_gap_minutes, grouped", [(60, True), (75, False)])
+def test_bucket_groups_chain_only_across_successive_nearby_occurrences(
+    last_gap_minutes, grouped
+) -> None:
+    """A 45-minute link followed by 60 minutes chains; a 75-minute link breaks."""
+    inputs = replace(
+        _inputs([0.0996, 0.1015, 0.0972, 0.1015, 0.0928, 0.20],
+                current_soc_percent=82.5, battery=_small_battery()),
+        timestamps=[
+            DAY_START + timedelta(minutes=minute)
+            for minute in (0, 15, 45, 60, 45 + last_gap_minutes, 60 + last_gap_minutes)
+        ],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert [target_power_w(plan.intervals[i]) for i in (0, 2, 4)] == (
+        [-1000, -1000, -1000] if grouped else [-1500, -1500, 0]
+    )
+
+
+def test_insufficient_grouped_bucket_fills_before_more_expensive_pool() -> None:
+    """Both bucket-8 slots run at max; bucket 9 shares only the 0.25 kWh remainder."""
+    prices = [0.085, 0.0996, 0.1015, 0.089, 0.0928, 0.20]
+    plan = create_greedy_charge_plan(
+        _inputs(prices, current_soc_percent=70, battery=_small_battery()),
+        CHARGE_THRESHOLD_PER_KWH,
+    )
+
+    assert [target_power_w(plan.intervals[i]) for i in (0, 3)] == [-1500, -1500]
+    assert [target_power_w(plan.intervals[i]) for i in (1, 4)] == [-500, -500]
+    assert plan.intervals[2].state is OperatingState.IDLE
+
+
+@pytest.mark.parametrize("charge_efficiency", [1.0, 0.9])
+def test_grouped_charging_preserves_intervening_profitable_discharge(
+    charge_efficiency,
+) -> None:
+    """An ordinary profitable gap remains a discharge and adds to the shared refill."""
+    inputs = replace(
+        _inputs([0.0996, 0.20, 0.0928], current_soc_percent=95,
+                battery=_small_battery(charge_efficiency=charge_efficiency,
+                                       discharge_efficiency=0.8)),
+        consumption_kwh=[0.0, 0.06, 0.0],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    before, gap, after = plan.intervals
+    expected_command = (0.1 + 0.4 + 0.06 / 0.8) / charge_efficiency / 2
+
+    assert before.target_battery_energy_kwh == pytest.approx(-expected_command)
+    assert after.target_battery_energy_kwh == pytest.approx(-expected_command)
+    assert gap.state is OperatingState.DISCHARGE
+    assert gap.target_battery_energy_kwh == pytest.approx(0.06)
+    assert target_power_w(gap) == 240
+    assert gap.expected_soc_percent == pytest.approx(96.25)
+    assert after.expected_soc_percent == pytest.approx(100)
+    assert plan.summary.total_discharge_kwh == pytest.approx(0.06)
+
+
+def test_grouped_charging_keeps_spike_discharge_with_zero_forecast_load() -> None:
+    """The existing spike rule still releases energy between shared buckets."""
+    inputs = replace(
+        _inputs([0.0996, 0.50, 0.0928], current_soc_percent=95,
+                battery=_small_battery()),
+        consumption_kwh=[0.0, 0.0, 0.0],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert [target_power_w(interval) for interval in plan.intervals] == [-1500, 1500, -1500]
+    assert plan.summary.spike_discharge_kwh == pytest.approx(0.375)
+
+
+def test_grouped_discharge_cannot_borrow_energy_from_later_charge_slots() -> None:
+    """Only the first pool share is available to the gap when starting at min SOC."""
+    inputs = replace(
+        _inputs([0.0996, 0.20, 0.0972, 0.0945, 0.0928],
+                battery=_small_battery(usable_capacity_kwh=1.0)),
+        consumption_kwh=[0.0, 0.375, 0.0, 0.0, 0.0],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    share_kwh = 0.375  # Preserve the original first slot's supply to the gap.
+
+    for index in (0, 2, 3, 4):
+        assert plan.intervals[index].target_battery_energy_kwh == pytest.approx(-share_kwh)
+    assert plan.intervals[1].target_battery_energy_kwh == pytest.approx(share_kwh)
+    assert all(
+        10 - 1e-9 <= interval.expected_soc_percent <= 100 + 1e-9
+        for interval in plan.intervals
+    )
+    assert plan.intervals[-1].expected_soc_percent == pytest.approx(100)
+
+
+def test_grouped_cheaper_future_pool_does_not_suppress_an_earlier_discharge() -> None:
+    """Cheap future capacity cannot replace the charge needed before a profit gap."""
+    inputs = replace(
+        _inputs([0.0996, 0.20, 0.085, 0.1015, 0.0928, 0.1015, 0.089],
+                battery=_small_battery(usable_capacity_kwh=0.5)),
+        consumption_kwh=[0.0, 0.06, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert plan.intervals[1].target_battery_energy_kwh == pytest.approx(0.06)
+    assert plan.intervals[0].target_battery_energy_kwh == pytest.approx(-0.06)
+    assert plan.intervals[4].target_battery_energy_kwh == pytest.approx(-0.06)
+    assert plan.intervals[2].target_battery_energy_kwh == pytest.approx(-0.245)
+    assert plan.intervals[6].target_battery_energy_kwh == pytest.approx(-0.245)
+    assert plan.intervals[-1].expected_soc_percent == pytest.approx(100)
 
 
 @pytest.mark.parametrize("negative_slots", [2, 8])

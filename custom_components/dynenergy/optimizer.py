@@ -280,6 +280,7 @@ def create_greedy_charge_plan(
 
     blocks = _charge_blocks(inputs, thresholds.charge_per_kwh)
     gaps = _discharge_gaps(blocks, len(inputs.timestamps))
+    allocated_through = -1
     for position, gap in enumerate(gaps):
         stored_energy_kwh = minimum_energy_kwh + _allocate_discharge(
             inputs,
@@ -295,20 +296,27 @@ def create_greedy_charge_plan(
             continue
 
         block = blocks[position]
-        _allocate_block_charge(
-            inputs,
-            charge_energy_by_index,
-            block,
-            stored_energy_kwh=stored_energy_kwh,
-            target_energy_kwh=target_energy_kwh,
-        )
-        if _can_defer_block_charge(
-            inputs, thresholds, blocks, gaps, position, charge_energy_by_index,
-            stored_energy_kwh, basis,
-        ):
-            for index in block:
-                charge_energy_by_index[index] = 0.0
-            continue
+        if position > allocated_through:
+            _allocate_block_charge(
+                inputs,
+                charge_energy_by_index,
+                block,
+                stored_energy_kwh=stored_energy_kwh,
+                target_energy_kwh=target_energy_kwh,
+            )
+            if _can_defer_block_charge(
+                inputs, thresholds, blocks, gaps, position, charge_energy_by_index,
+                stored_energy_kwh, basis,
+            ):
+                for index in block:
+                    charge_energy_by_index[index] = 0.0
+                continue
+            pools, allocated_through = _charge_bucket_pools(inputs, blocks, position)
+            if allocated_through > position:
+                _allocate_grouped_charge(
+                    inputs, thresholds, blocks, gaps, position, allocated_through,
+                    pools, charge_energy_by_index, stored_energy_kwh, basis,
+                )
         for index in block:
             absorbed_charge_kwh = _absorbed_charge_kwh(
                 battery,
@@ -484,6 +492,225 @@ def _price_buckets(
     return [tuple(buckets[key]) for key in sorted(buckets)]
 
 
+def _charge_bucket_pools(
+    inputs: OptimizerInputs,
+    blocks: Sequence[tuple[int, ...]],
+    position: int,
+) -> tuple[list[tuple[int, ...]], int]:
+    """Pool nearby equal-key buckets, retaining the original block boundaries.
+
+    Each link compares the previous bucket's last timestamp with the next
+    bucket's first timestamp, so consecutive links can span more than an hour.
+    Blocks connected by a pool share a charging budget; their other buckets
+    remain separate pools, ordered by key, and their discharge gaps stay intact.
+    """
+    groups: dict[int, list[tuple[list[int], int]]] = {}
+    for block_position in range(position, len(blocks)):
+        for bucket in _price_buckets(inputs, blocks[block_position]):
+            key = floor(inputs.prices_per_kwh[bucket[0]] / CHARGE_PRICE_BUCKET_WIDTH)
+            same_key = groups.setdefault(key, [])
+            if same_key and (
+                inputs.timestamps[bucket[0]].timestamp()
+                - inputs.timestamps[same_key[-1][0][-1]].timestamp()
+                <= 60 * 60
+            ):
+                indices, _ = same_key[-1]
+                indices.extend(bucket)
+                same_key[-1] = (indices, block_position)
+            else:
+                same_key.append((list(bucket), block_position))
+
+    last_block_by_index = {
+        index: last_block
+        for same_key in groups.values()
+        for indices, last_block in same_key
+        for index in indices
+    }
+    last_position = position
+    cursor = position
+    while cursor <= last_position:
+        last_position = max(
+            last_position, *(last_block_by_index[index] for index in blocks[cursor])
+        )
+        cursor += 1
+    last_index = blocks[last_position][-1]
+    return [
+        tuple(indices)
+        for key in sorted(groups)
+        for indices, _ in groups[key]
+        if indices[0] <= last_index
+    ], last_position
+
+
+def _allocate_grouped_charge(
+    inputs: OptimizerInputs,
+    thresholds: PriceThresholds,
+    blocks: Sequence[tuple[int, ...]],
+    gaps: Sequence[range],
+    first_position: int,
+    last_position: int,
+    pools: Sequence[tuple[int, ...]],
+    charge_energy_by_index: list[float],
+    stored_energy_kwh: float,
+    basis: _CostBasis,
+) -> None:
+    """Share a charge budget across pools, including intervening refill demand.
+
+    Preview the original gaps with the same discharge allocator and only energy
+    already absorbed. If a gap releases energy, enlarge the shared budget and
+    redistribute it equally before replaying the timeline. The budget only
+    increases, bounded by the pools' combined charging capacity.
+    """
+    battery = inputs.battery
+    minimum_kwh = battery.usable_capacity_kwh * battery.min_soc_percent / 100
+    target_kwh = battery.usable_capacity_kwh * battery.max_soc_percent / 100
+    capacity_kwh = sum(len(pool) for pool in pools) * interval_energy_limit_kwh(
+        battery.max_charge_power_kw
+    )
+    requested_kwh = min(
+        capacity_kwh, _requested_charge_kwh(battery, stored_energy_kwh, target_kwh)
+    )
+    original_discharge = _unpooled_discharge(
+        inputs, thresholds, blocks, gaps, first_position, last_position,
+        stored_energy_kwh, basis,
+    )
+    minimum_shares: dict[int, float] = {}
+    while True:
+        _allocate_bucket_charge(
+            inputs, charge_energy_by_index, pools, requested_kwh, minimum_shares
+        )
+        projected_kwh = stored_energy_kwh
+        projected_basis = copy(basis)
+        projected_discharge = [0.0] * len(inputs.timestamps)
+        reserved_earlier_charge = False
+        for position in range(first_position, last_position + 1):
+            if position > first_position:
+                floor_per_kwh = _discharge_floor_per_kwh(
+                    inputs, thresholds, blocks, position, target_kwh - minimum_kwh
+                )
+                spike_per_kwh = projected_basis.per_kwh() + SPIKE_PREMIUM_PER_KWH
+                projected_kwh = minimum_kwh + _allocate_discharge(
+                    inputs, projected_discharge, projected_kwh - minimum_kwh,
+                    gaps[position], floor_per_kwh, spike_per_kwh,
+                )
+                # Pooling must not defer energy needed for an existing profit
+                # opportunity. Recheck eligibility against the pooled cost basis.
+                eligible_discharge = [0.0] * len(inputs.timestamps)
+                _allocate_discharge(
+                    inputs, eligible_discharge, target_kwh - minimum_kwh,
+                    gaps[position], floor_per_kwh, spike_per_kwh,
+                )
+                shortage_kwh = sum(
+                    max(0.0, min(original_discharge[index], eligible_discharge[index])
+                        - projected_discharge[index])
+                    for index in gaps[position]
+                ) / (battery.charge_efficiency * battery.discharge_efficiency)
+                if shortage_kwh > ENERGY_EPSILON_KWH:
+                    reserved_earlier_charge = _reserve_charge_before_gap(
+                        inputs, pools, charge_energy_by_index, minimum_shares,
+                        gaps[position].start, shortage_kwh,
+                    )
+                    if reserved_earlier_charge:
+                        break
+            for index in blocks[position]:
+                absorbed_kwh = _absorbed_charge_kwh(
+                    battery, charge_energy_by_index[index], projected_kwh, target_kwh
+                )
+                projected_kwh += absorbed_kwh * battery.charge_efficiency
+                projected_basis.add(absorbed_kwh, inputs.prices_per_kwh[index])
+
+        if reserved_earlier_charge:
+            requested_kwh = max(
+                requested_kwh,
+                sum(len(pool) * minimum_shares.get(pool[0], 0.0) for pool in pools),
+            )
+            continue
+        refill_kwh = sum(projected_discharge) / battery.discharge_efficiency
+        required_kwh = _requested_charge_kwh(
+            battery, stored_energy_kwh - refill_kwh, target_kwh
+        )
+        # Early commands can be refused at max SOC before a later discharge.
+        # Keep enough capacity after that gap to reach the original SOC target.
+        required_kwh = max(
+            required_kwh,
+            requested_kwh + max(0.0, target_kwh - projected_kwh)
+            / battery.charge_efficiency,
+        )
+        next_request_kwh = min(capacity_kwh, required_kwh)
+        if next_request_kwh <= requested_kwh + ENERGY_EPSILON_KWH:
+            return
+        requested_kwh = next_request_kwh
+
+
+def _reserve_charge_before_gap(
+    inputs: OptimizerInputs,
+    pools: Sequence[tuple[int, ...]],
+    charge_energy_by_index: Sequence[float],
+    minimum_shares: dict[int, float],
+    gap_start: int,
+    shortage_kwh: float,
+) -> bool:
+    """Reserve equal pool shares for energy that must arrive before a gap."""
+    maximum_kwh = interval_energy_limit_kwh(inputs.battery.max_charge_power_kw)
+    changed = False
+    for pool in pools:
+        earlier_count = sum(index < gap_start for index in pool)
+        if not earlier_count:
+            continue
+        share_kwh = charge_energy_by_index[pool[0]]
+        increase_kwh = min(maximum_kwh - share_kwh, shortage_kwh / earlier_count)
+        if increase_kwh <= ENERGY_EPSILON_KWH:
+            continue
+        minimum_shares[pool[0]] = share_kwh + increase_kwh
+        shortage_kwh -= increase_kwh * earlier_count
+        changed = True
+        if shortage_kwh <= ENERGY_EPSILON_KWH:
+            break
+    return changed
+
+
+def _unpooled_discharge(
+    inputs: OptimizerInputs,
+    thresholds: PriceThresholds,
+    blocks: Sequence[tuple[int, ...]],
+    gaps: Sequence[range],
+    first_position: int,
+    last_position: int,
+    stored_energy_kwh: float,
+    basis: _CostBasis,
+) -> list[float]:
+    """Forecast the existing chronological discharge that pooling must preserve."""
+    battery = inputs.battery
+    minimum_kwh = battery.usable_capacity_kwh * battery.min_soc_percent / 100
+    target_kwh = battery.usable_capacity_kwh * battery.max_soc_percent / 100
+    projected_basis = copy(basis)
+    charges = [0.0] * len(inputs.timestamps)
+    discharges = [0.0] * len(inputs.timestamps)
+    for position in range(first_position, last_position + 1):
+        if position > first_position:
+            stored_energy_kwh = minimum_kwh + _allocate_discharge(
+                inputs, discharges, stored_energy_kwh - minimum_kwh, gaps[position],
+                _discharge_floor_per_kwh(
+                    inputs, thresholds, blocks, position, target_kwh - minimum_kwh
+                ),
+                projected_basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
+            )
+        block = blocks[position]
+        _allocate_block_charge(inputs, charges, block, stored_energy_kwh, target_kwh)
+        if _can_defer_block_charge(
+            inputs, thresholds, blocks, gaps, position, charges,
+            stored_energy_kwh, projected_basis,
+        ):
+            continue
+        for index in block:
+            absorbed_kwh = _absorbed_charge_kwh(
+                battery, charges[index], stored_energy_kwh, target_kwh
+            )
+            stored_energy_kwh += absorbed_kwh * battery.charge_efficiency
+            projected_basis.add(absorbed_kwh, inputs.prices_per_kwh[index])
+    return discharges
+
+
 def _requested_charge_kwh(
     battery: BatteryParameters, stored_energy_kwh: float, target_energy_kwh: float
 ) -> float:
@@ -588,17 +815,35 @@ def _allocate_block_charge(
     more slowly than commanded still reaches its target.
     """
     battery = inputs.battery
-    max_charge_energy_kwh = interval_energy_limit_kwh(battery.max_charge_power_kw)
     requested_kwh = _requested_charge_kwh(battery, stored_energy_kwh, target_energy_kwh)
-    if requested_kwh <= ENERGY_EPSILON_KWH:
-        return
+    _allocate_bucket_charge(
+        inputs, charge_energy_by_index, _price_buckets(inputs, block), requested_kwh
+    )
 
-    remaining_kwh = min(requested_kwh, len(block) * max_charge_energy_kwh)
-    for bucket in _price_buckets(inputs, block):
-        capability_kwh = len(bucket) * max_charge_energy_kwh
+
+def _allocate_bucket_charge(
+    inputs: OptimizerInputs,
+    charge_energy_by_index: list[float],
+    buckets: Sequence[tuple[int, ...]],
+    requested_kwh: float,
+    minimum_shares: Mapping[int, float] | None = None,
+) -> None:
+    """Reserve necessary earlier energy, then fill cheapest pools equally."""
+    max_charge_energy_kwh = interval_energy_limit_kwh(inputs.battery.max_charge_power_kw)
+    remaining_kwh = requested_kwh
+    for bucket in buckets:
+        share_kwh = minimum_shares.get(bucket[0], 0.0) if minimum_shares else 0.0
+        for index in bucket:
+            charge_energy_by_index[index] = share_kwh
+        remaining_kwh -= share_kwh * len(bucket)
+    for bucket in buckets:
+        if remaining_kwh <= ENERGY_EPSILON_KWH:
+            return
+        share_kwh = charge_energy_by_index[bucket[0]]
+        capability_kwh = len(bucket) * (max_charge_energy_kwh - share_kwh)
         if capability_kwh >= remaining_kwh:
             for index in bucket:
-                charge_energy_by_index[index] = remaining_kwh / len(bucket)
+                charge_energy_by_index[index] = share_kwh + remaining_kwh / len(bucket)
             return
         for index in bucket:
             charge_energy_by_index[index] = max_charge_energy_kwh
