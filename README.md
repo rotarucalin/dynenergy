@@ -152,10 +152,12 @@ for the part of the day before the first block.
 
 The initial demand profile is 0.3125 kWh (an average 1.25 kW) per 15 minutes
 from Monday to Thursday, 07:45-18:30, and Friday, 07:45-13:30. All other
-intervals use 0.015 kWh (an average 60 W). DynEnergy keeps one running average
+intervals use 0.060 kWh (an average 240 W). DynEnergy keeps one running average
 for each of the 672 quarter-hour slots in a week. At every quarter-hour boundary
 it adds the completed interval's grid-import delta to the corresponding average
-and persists the profile. New plans use the learned values.
+and persists the profile. New plans use the learned values. When loading a stored
+profile, slots with zero samples receive the current default for their weekday
+and time; learned averages and their sample counts are preserved.
 
 ## Entities
 

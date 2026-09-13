@@ -10,7 +10,11 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from custom_components.dynenergy.accounting import BatteryCostAccount
-from custom_components.dynenergy.optimizer import WeeklyConsumptionProfile
+from custom_components.dynenergy.optimizer import (
+    INTERVALS_PER_WEEK,
+    OperatingState,
+    WeeklyConsumptionProfile,
+)
 
 
 def _load_coordinator():
@@ -74,6 +78,82 @@ coordinator_module = _load_coordinator()
 
 
 class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_profile_reaches_optimizer_and_helper_on_startup(self):
+        """Fresh and migrated idle defaults request +240 W; learned data survives."""
+        start = datetime(2026, 9, 14, tzinfo=UTC)  # Monday's first idle slot.
+        states = {
+            "sensor.price": SimpleNamespace(state="0.20", attributes={"data": [{
+                "start_time": start.isoformat(),
+                "end_time": (start + timedelta(minutes=15)).isoformat(),
+                "price_per_kwh": 0.20,  # Discharge is permitted without a spike.
+            }]}),
+        }
+        config = {
+            "price_entity": "sensor.price",
+            "min_soc_percent": 10,
+            "max_soc_percent": 100,
+            "charge_efficiency": 0.9,
+            "discharge_efficiency": 0.8,
+            "charge_power_target_entity": "input_number.target",
+        }
+        for key, value, unit in [
+            ("soc_entity", "50", "%"),
+            ("capacity_entity", "2", "kWh"),
+            ("max_charge_power_entity", "1500", "W"),
+            ("max_discharge_power_entity", "1500", "W"),
+            ("battery_charged_energy_entity", "0", "kWh"),
+            ("battery_discharged_energy_entity", "0", "kWh"),
+        ]:
+            config[key] = f"sensor.{key}"
+            states[config[key]] = SimpleNamespace(
+                state=value, attributes={"unit_of_measurement": unit}
+            )
+
+        for source, sample_count, expected_kwh, expected_watts in [
+            ("fresh", 0, 0.060, 240),
+            ("persisted_unlearned", 0, 0.060, 240),
+            ("persisted_learned", 2, 0.015, 60),
+        ]:
+            with self.subTest(source=source):
+                payload = None
+                if source != "fresh":
+                    payload = {
+                        "values_kwh": [0.015] * INTERVALS_PER_WEEK,
+                        "sample_counts": [0] * INTERVALS_PER_WEEK,
+                    }
+                    payload["sample_counts"][0] = sample_count
+                hass = SimpleNamespace(
+                    states=SimpleNamespace(get=states.get),
+                    services=SimpleNamespace(async_call=AsyncMock()),
+                )
+                entry = SimpleNamespace(entry_id="test", data=config)
+                coordinator = coordinator_module.DynEnergyCoordinator(hass, entry)
+                coordinator._account_store = SimpleNamespace(
+                    async_load=AsyncMock(return_value=None), async_save=AsyncMock()
+                )
+                coordinator._consumption_profile_store = SimpleNamespace(
+                    async_load=AsyncMock(return_value=payload)
+                )
+                with patch.object(coordinator_module.dt_util, "now", return_value=start):
+                    await coordinator.async_start()
+
+                hass.services.async_call.assert_awaited_with(
+                    "input_number", "set_value",
+                    {"entity_id": "input_number.target", "value": expected_watts},
+                    blocking=True,
+                )
+                self.assertIsNone(coordinator.data.planning_error)
+                interval, = coordinator.data.plan.intervals
+                self.assertEqual(interval.state, OperatingState.DISCHARGE)
+                self.assertEqual(interval.consumption_kwh, expected_kwh)
+                self.assertAlmostEqual(interval.target_battery_energy_kwh, expected_kwh)
+                self.assertAlmostEqual(
+                    interval.expected_soc_percent, (1.0 - expected_kwh / 0.8) / 2 * 100
+                )
+                self.assertEqual(
+                    coordinator.data.consumption_profile.sample_counts[0], sample_count
+                )
+
     async def test_configured_limits_keep_kw_through_planning_and_helper_output(self):
         """Real HA readings, SOC prediction and helper writes share one unit path."""
         start = datetime(2026, 9, 14, 8, tzinfo=UTC)

@@ -15,8 +15,9 @@ INTERVALS_PER_HOUR = int(1 / INTERVAL_HOURS)
 INTERVAL_MINUTES = int(INTERVAL_HOURS * 60)
 INTERVALS_PER_DAY = 24 * INTERVALS_PER_HOUR
 INTERVALS_PER_WEEK = 7 * INTERVALS_PER_DAY
-ACTIVE_CONSUMPTION_KWH = 1.25 * INTERVAL_HOURS
-IDLE_CONSUMPTION_KWH = 0.06 * INTERVAL_HOURS
+# Default consumption is energy in kWh per 15-minute slot.
+ACTIVE_CONSUMPTION_KWH = 0.3125  # Average working-hour power of 1.25 kW.
+IDLE_CONSUMPTION_KWH = 0.06  # Average idle power of 240 W.
 MAX_CHARGE_PRICE_PER_KWH = 0.10
 MIN_DISCHARGE_PRICE_PER_KWH = 0.13
 CHARGE_PRICE_BAND = 0.25
@@ -132,7 +133,7 @@ class WeeklyConsumptionProfile:
     def from_dict(
         cls, data: Mapping[str, object] | None
     ) -> WeeklyConsumptionProfile:
-        """Restore a profile, falling back to defaults for invalid payloads."""
+        """Restore learned values and use current defaults for unlearned slots."""
         if not data:
             return cls.default()
         raw_values = data.get("values_kwh")
@@ -149,6 +150,11 @@ class WeeklyConsumptionProfile:
             counts = tuple(max(0, int(count)) for count in raw_counts)
         except (TypeError, ValueError):
             return cls.default()
+        defaults = cls.default().values_kwh
+        values = tuple(
+            value if count > 0 else default
+            for value, count, default in zip(values, counts, defaults, strict=True)
+        )
         return cls(values, counts)
 
     def as_dict(self) -> dict[str, list[float] | list[int]]:

@@ -111,6 +111,54 @@ def test_weekly_profile_learns_a_running_average() -> None:
     assert WeeklyConsumptionProfile.from_dict(profile.as_dict()) == profile
 
 
+@pytest.mark.parametrize(
+    "weekday, active_start, active_end",
+    [
+        (0, 31, 74), (1, 31, 74), (2, 31, 74), (3, 31, 74),
+        (4, 31, 54), (5, 0, 0), (6, 0, 0),
+    ],
+)
+def test_default_profile_values_are_kwh_per_quarter_hour(
+    weekday, active_start, active_end
+) -> None:
+    """Seed 60 Wh idle slots and preserve 312.5 Wh working-hour slots."""
+    profile = WeeklyConsumptionProfile.default()
+    day = datetime(2026, 9, 7, tzinfo=UTC) + timedelta(days=weekday)
+
+    assert profile.sample_counts == (0,) * INTERVALS_PER_WEEK
+    for slot in range(INTERVALS_PER_DAY):
+        timestamp = day + timedelta(minutes=15 * slot)
+        expected_kwh = 0.3125 if active_start <= slot < active_end else 0.060
+        assert default_consumption_kwh(timestamp) == expected_kwh
+        assert profile.consumption_kwh(timestamp) == expected_kwh
+
+
+@pytest.mark.parametrize("stale_fallback_kwh", [0.015, 1.25])
+def test_profile_load_refreshes_only_unlearned_slots(stale_fallback_kwh) -> None:
+    """Refresh each slot's fallback without mistaking real samples for defaults."""
+    values = [stale_fallback_kwh] * INTERVALS_PER_WEEK
+    counts = [0] * INTERVALS_PER_WEEK
+    learned_slots = {
+        0: (0.015, 1),  # A learned idle value may equal the old fallback.
+        32: (0.45, 3),  # Learned working-hour consumption.
+        33: (0.3125, 2),  # A learned value may equal the current fallback.
+        34: (0.0, 5),  # Zero is also a valid learned consumption value.
+        5 * INTERVALS_PER_DAY + 40: (0.12, 2),  # Learned weekend consumption.
+    }
+    expected_values = list(WeeklyConsumptionProfile.default().values_kwh)
+    for index, (value, count) in learned_slots.items():
+        values[index] = expected_values[index] = value
+        counts[index] = count
+
+    profile = WeeklyConsumptionProfile.from_dict(
+        {"values_kwh": values, "sample_counts": counts}
+    )
+
+    assert profile.values_kwh == tuple(expected_values)
+    assert profile.sample_counts == tuple(counts)
+    assert WeeklyConsumptionProfile.from_dict(profile.as_dict()) == profile
+
+
 CAPACITY_KWH = 10.0
 MIN_SOC_PERCENT = 10.0
 MAX_SOC_PERCENT = 100.0
