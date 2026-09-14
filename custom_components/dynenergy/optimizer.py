@@ -18,7 +18,6 @@ INTERVALS_PER_WEEK = 7 * INTERVALS_PER_DAY
 # Default consumption is energy in kWh per 15-minute slot.
 ACTIVE_CONSUMPTION_KWH = 0.3125  # Average working-hour power of 1.25 kW.
 IDLE_CONSUMPTION_KWH = 0.06  # Average idle power of 240 W.
-MAX_CHARGE_PRICE_PER_KWH = 0.10
 MIN_DISCHARGE_PRICE_PER_KWH = 0.13
 CHARGE_PRICE_BAND = 0.25
 PRE_CHARGE_DISCHARGE_PRICE_BAND = 0.50
@@ -228,14 +227,18 @@ def calculate_price_thresholds(
     inputs: OptimizerInputs,
     charge_price_threshold_per_kwh: float,
 ) -> PriceThresholds:
-    """Return hard-guarded thresholds from the daily EPEX price range."""
+    """Return thresholds derived from the configured price and the daily EPEX range.
+
+    The configured price is the cap on the charge threshold (no more hard-coded
+    10 ct/kWh ceiling); the relative price band can still pull it lower on days
+    with a narrow price range.
+    """
     minimum_price_per_kwh = min(inputs.prices_per_kwh)
     price_range_per_kwh = max(inputs.prices_per_kwh) - minimum_price_per_kwh
 
     return PriceThresholds(
         charge_per_kwh=min(
             charge_price_threshold_per_kwh,
-            MAX_CHARGE_PRICE_PER_KWH,
             minimum_price_per_kwh + CHARGE_PRICE_BAND * price_range_per_kwh,
         ),
         pre_charge_discharge_per_kwh=max(
