@@ -16,14 +16,15 @@ realized EPEX savings when that energy is discharged.
   positive Watts discharge, and zero is idle.
 - Uses configurable battery capacity, power limits, SOC limits, and round-trip
   efficiency.
-- Uses daily dynamic price thresholds with a 10 ct/kWh maximum charge price and
+- Uses daily dynamic price thresholds capped by the configured charge price and
   a 13 ct/kWh minimum discharge price.
 - Discharges existing energy before charging and available energy after charging
   to the highest-priced eligible household demand slots.
 - Monitors cumulative battery charged/discharged energy every 15 minutes and
   publishes the cost of stored energy, total charging costs, and total savings.
-- Learns a persistent 672-slot weekly consumption profile from the cumulative
-  grid-import meter and exposes it through the Typical consumption sensor.
+- Rebuilds a 672-slot weekly consumption profile from up to four weeks of
+  recorder history for the house consumption meter and exposes it through the
+  Typical consumption sensor.
 - Persists accounting data and meter baselines across Home Assistant restarts.
 
 ## Requirements
@@ -35,8 +36,12 @@ realized EPEX savings when that energy is discharged.
   `end_time`, and `price_per_kwh`.
 - Battery sensors for SOC, usable capacity, power limits, and cumulative charged
   and discharged energy.
+- A cumulative house consumption energy sensor in kWh.
 - An `input_number` helper that your battery automation or integration uses as a
   signed power target in Watts.
+- The `recorder` integration enabled, with long enough retention for the
+  consumption sensor to accumulate statistics. DynEnergy averages whatever the
+  recorder still holds; without it the profile stays on its defaults.
 
 ## Installation
 
@@ -88,9 +93,9 @@ select the cumulative battery charged and discharged energy sensors.
 | Usable battery capacity entity | kWh | Usable, not nameplate, capacity. |
 | Maximum charging power entity | kW | Physical charge limit. |
 | Maximum discharging power entity | kW | Physical discharge limit. |
-| Cumulative grid-import energy entity | kWh total | Used every 15 minutes to learn the typical weekly consumption profile. |
+| Cumulative house consumption energy entity | kWh total | Recorder history for this sensor builds the typical weekly consumption profile. |
 | Writable battery power helper | `input_number`, W | Negative charge, positive discharge, zero idle. |
-| Charge price threshold | EUR/kWh | Additional user cap; defaults to `0.10`. |
+| Charge price threshold | EUR/kWh | Ceiling on the daily charge threshold; defaults to `0.10`. |
 | Minimum / maximum SOC | Percent | Must be ordered and within 0-100. |
 | Charge / discharge efficiency | Decimal | Defaults to `0.95` for each direction. |
 | Battery degradation cost | EUR/kWh | Included in the plan cost estimate. Defaults to `0`. |
@@ -156,14 +161,25 @@ the plan reports the part booked above the forecast separately as
 charge blocks already walked, falling back to the measured `Stored energy cost`
 for the part of the day before the first block.
 
-The initial demand profile is 0.3125 kWh (an average 1.25 kW) per 15 minutes
-from Monday to Thursday, 07:45-18:30, and Friday, 07:45-13:30. All other
-intervals use 0.060 kWh (an average 240 W). DynEnergy keeps one running average
-for each of the 672 quarter-hour slots in a week. At every quarter-hour boundary
-it adds the completed interval's grid-import delta to the corresponding average
-and persists the profile. New plans use the learned values. When loading a stored
-profile, slots with zero samples receive the current default for their weekday
-and time; learned averages and their sample counts are preserved.
+Household demand comes from a profile of 672 quarter-hour slots, one per
+15 minutes of the week. DynEnergy rebuilds the whole profile from recorder
+statistics for the house consumption entity: at startup and again after each
+nightly plan it reads the last four weeks, or less when the recorder keeps
+less, sums the five-minute `change` values into completed quarter hours, and
+averages every quarter hour onto its weekday-and-time slot. The averages are
+never folded incrementally and nothing is persisted, so each rebuild also
+corrects the day that just finished.
+
+Measured averages are then trimmed by 0.0125 kWh, a sustained 50 W across the
+slot, before they become a forecast. Discharge is capped at the forecast, so
+the trim keeps the battery slightly under the real house draw instead of
+pushing energy out to the grid. The trim floors at zero.
+
+Slots the history does not cover keep their default, untrimmed because a guess
+is not a measurement: 0.3125 kWh (an average 1.25 kW) from Monday to Thursday,
+07:45-18:30, and Friday, 07:45-13:30, and 0.060 kWh (an average 240 W)
+everywhere else. With no consumption entity configured, no recorder, or no
+statistics for the entity, the profile is entirely defaults.
 
 ## Entities
 
@@ -173,7 +189,7 @@ DynEnergy creates these sensors:
 |---|---|---|
 | Battery plan | EUR | Expected daily EPEX saving from the current day-ahead plan. Its attributes contain the full schedule, plan summary, source readings, and status. |
 | Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
-| Typical consumption | W | Learned average for the current weekly slot. Its attributes contain all 672 weekly averages and their sample counts. |
+| Typical consumption | W | Forecast demand for the current weekly slot. Its attributes contain all 672 weekly values and how many history samples each one averages. |
 | Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. Its attributes add the stored energy, the total charged energy, and the lifetime average price paid per charged kWh. |
 | Total costs | EUR | Cumulative EPEX value of actual measured battery charging. |
 | Total savings | EUR | Cumulative EPEX value of actual measured battery discharge. |
@@ -278,8 +294,9 @@ disconnected from automatic control first.
 
 ## Current Limitations
 
-- The learned consumption profile uses grid import as the consumption signal;
-  behind-the-meter generation is not included in that profile.
+- The consumption profile is only as good as the recorder history behind it.
+  Slots the recorder does not cover fall back to flat defaults, and a fresh
+  install or a short retention window leaves most of the week on those defaults.
 - Discharge only offsets modeled household demand. Export optimization is out of
   scope.
 - The plan is generated once daily and assumes the current SOC is the opening
@@ -294,9 +311,9 @@ load the updated setup, coordinator, and sensor modules. Subsequent edits to
 DynEnergy config entry under **Settings > Devices & services**.
 
 Entry setup reloads only the optimizer module, creates a fresh coordinator,
-restores the stored profile and accounting, and generates a startup plan before
-loading the sensors. If required inputs are still unavailable, the existing
-five-second readiness check applies. Unloading retains the safe 0 W target,
+rebuilds the consumption profile, restores accounting, and generates a startup
+plan before loading the sensors. If required inputs are still unavailable, the
+existing five-second readiness check applies. Unloading retains the safe 0 W target,
 so a reload can briefly interrupt battery operation. Changes outside
 `optimizer.py` still require a Home Assistant restart.
 

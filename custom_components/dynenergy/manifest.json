@@ -1,6 +1,7 @@
 {
   "domain": "dynenergy",
   "name": "DynEnergy",
+  "after_dependencies": ["recorder"],
   "codeowners": ["@rotarucalin"],
   "config_flow": true,
   "documentation": "https://github.com/rotarucalin/dynenergy",

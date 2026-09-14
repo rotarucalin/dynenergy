@@ -116,19 +116,14 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
                 state=value, attributes={"unit_of_measurement": unit}
             )
 
-        for source, sample_count, expected_kwh, expected_watts in [
-            ("fresh", 0, 0.060, 240),
-            ("persisted_unlearned", 0, 0.060, 240),
-            ("persisted_learned", 2, 0.015, 60),
+        # Two Mondays of history for slot 0 average to 0.0275 kWh, which the
+        # 0.0125 kWh margin trims to the 0.015 kWh / 60 W the learned case expects.
+        history = [(start - timedelta(days=7), 0.03), (start, 0.025)]
+        for source, samples, sample_count, expected_kwh, expected_watts in [
+            ("no_history", [], 0, 0.060, 240),
+            ("history", history, 2, 0.015, 60),
         ]:
             with self.subTest(source=source):
-                payload = None
-                if source != "fresh":
-                    payload = {
-                        "values_kwh": [0.015] * INTERVALS_PER_WEEK,
-                        "sample_counts": [0] * INTERVALS_PER_WEEK,
-                    }
-                    payload["sample_counts"][0] = sample_count
                 hass = SimpleNamespace(
                     states=SimpleNamespace(get=states.get),
                     services=SimpleNamespace(async_call=AsyncMock()),
@@ -138,10 +133,14 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
                 coordinator._account_store = SimpleNamespace(
                     async_load=AsyncMock(return_value=None), async_save=AsyncMock()
                 )
-                coordinator._consumption_profile_store = SimpleNamespace(
-                    async_load=AsyncMock(return_value=payload)
-                )
-                with patch.object(coordinator_module.dt_util, "now", return_value=start):
+                with (
+                    patch.object(coordinator_module.dt_util, "now", return_value=start),
+                    patch.object(
+                        coordinator_module,
+                        "async_load_consumption_samples",
+                        AsyncMock(return_value=samples),
+                    ),
+                ):
                     await coordinator.async_start()
 
                 hass.services.async_call.assert_awaited_with(
@@ -644,10 +643,7 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_registers_only_daily_and_quarter_hour_callbacks(self):
         coordinator = self.coordinator
-        coordinator._consumption_profile_store = SimpleNamespace(
-            async_load=AsyncMock(return_value=WeeklyConsumptionProfile.default().as_dict())
-        )
-        coordinator._start_consumption_tracking = Mock()
+        coordinator._async_refresh_consumption_profile = AsyncMock()
         coordinator._async_restore_plan = AsyncMock()
         coordinator._async_apply_scheduled_power = AsyncMock()
         with (
@@ -668,17 +664,63 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
         async def accounting(now):
             calls.append("accounting")
 
-        async def learning(now):
-            calls.append("learning")
-
         async def applying(now):
             calls.append("applying")
 
         coordinator._async_monitor_battery_energy = accounting
-        coordinator._async_update_consumption_profile = learning
         coordinator._async_apply_scheduled_power = applying
         await coordinator._async_run_interval_tasks(self.start)
-        self.assertEqual(calls, ["accounting", "learning", "applying"])
+        self.assertEqual(calls, ["accounting", "applying"])
+
+    async def test_nightly_plan_refreshes_the_consumption_profile_afterwards(self):
+        """Tomorrow's plan is built first, then today's actuals correct the profile."""
+        coordinator = self.coordinator
+        calls = []
+        coordinator._async_refresh_plan = AsyncMock(
+            side_effect=lambda *args, **kwargs: calls.append("plan")
+        )
+        coordinator._async_refresh_consumption_profile = AsyncMock(
+            side_effect=lambda: calls.append("profile")
+        )
+
+        await coordinator._async_create_next_day_plan(self.start)
+
+        self.assertEqual(calls, ["plan", "profile"])
+        target_date, = coordinator._async_refresh_plan.await_args.args
+        self.assertEqual(target_date, self.start.date() + timedelta(days=1))
+
+    async def test_shutdown_during_nightly_planning_skips_the_profile_refresh(self):
+        """A teardown mid-plan must not start another recorder read."""
+        coordinator = self.coordinator
+
+        async def refresh_then_shut_down(*args, **kwargs):
+            coordinator._shutting_down = True
+
+        coordinator._async_refresh_plan = AsyncMock(side_effect=refresh_then_shut_down)
+        coordinator._async_refresh_consumption_profile = AsyncMock()
+
+        await coordinator._async_create_next_day_plan(self.start)
+
+        coordinator._async_refresh_consumption_profile.assert_not_awaited()
+
+    async def test_profile_refresh_reads_the_configured_consumption_entity(self):
+        """The rebuild passes the configured entity and the four-week cap through."""
+        coordinator = self.coordinator
+        samples = [(self.start, 0.5)]
+        with patch.object(
+            coordinator_module,
+            "async_load_consumption_samples",
+            AsyncMock(return_value=samples),
+        ) as load:
+            await coordinator._async_refresh_consumption_profile()
+
+        _hass, entity_id, max_days = load.await_args.args
+        self.assertEqual(entity_id, coordinator.entry.data.get("consumed_energy_entity"))
+        self.assertEqual(max_days, coordinator_module.CONSUMPTION_HISTORY_DAYS)
+        self.assertEqual(
+            coordinator._consumption_profile,
+            WeeklyConsumptionProfile.from_samples(samples),
+        )
 
 
 if __name__ == "__main__":

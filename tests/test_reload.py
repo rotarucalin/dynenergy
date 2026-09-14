@@ -102,10 +102,11 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         self.callbacks = {}
         self.entities = []
         self.events = []
-        profile = optimizer.WeeklyConsumptionProfile.default().record(
-            start + timedelta(minutes=15), 0.123
-        )
-        self.persisted = {"dynenergy.test.consumption_profile": profile.as_dict()}
+        self.persisted = {}
+        # One measured quarter hour in slot 1; the margin trims it to 0.123 kWh.
+        self.history_samples = [
+            (start + timedelta(minutes=15), 0.123 + optimizer.CONSUMPTION_MARGIN_KWH)
+        ]
 
         async def executor(job, *args):
             return await asyncio.to_thread(job, *args)
@@ -149,6 +150,10 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.enterContext(patch.object(coordinator_module, "async_track_time_change", track))
         self.enterContext(patch.object(coordinator_module, "Store", store))
+        self.enterContext(patch.object(
+            coordinator_module, "async_load_consumption_samples",
+            AsyncMock(side_effect=lambda *args: list(self.history_samples)),
+        ))
         self.enterContext(patch.object(coordinator_module.dt_util, "now", return_value=self.now))
         real_coordinator = coordinator_module.DynEnergyCoordinator
 
@@ -242,7 +247,9 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNot(coordinator, previous)
                 self.assertIsNot(type(coordinator.data.plan), type(previous.data.plan))
             self.assertEqual(coordinator.data.plan.intervals[0].consumption_kwh, idle_kwh)
-            self.assertEqual(coordinator.data.consumption_profile.values_kwh[1], 0.123)
+            self.assertAlmostEqual(
+                coordinator.data.consumption_profile.values_kwh[1], 0.123
+            )
             self.assertEqual(coordinator.data.consumption_profile.sample_counts[1], 1)
             self.assertEqual(self.entities[1].native_value, watts)
             self.assertEqual(self.entities[0].extra_state_attributes["intervals"][0]

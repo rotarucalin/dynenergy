@@ -8,6 +8,7 @@ import pytest
 from custom_components.dynenergy.optimizer import (
     ACTIVE_CONSUMPTION_KWH,
     CHARGE_MARGIN_FRACTION,
+    CONSUMPTION_MARGIN_KWH,
     IDLE_CONSUMPTION_KWH,
     INTERVAL_HOURS,
     INTERVALS_PER_DAY,
@@ -25,6 +26,7 @@ from custom_components.dynenergy.optimizer import (
     default_consumption_kwh,
     interval_energy_limit_kwh,
     target_power_w,
+    weekly_slot_index,
 )
 
 
@@ -97,20 +99,50 @@ def test_default_weekly_consumption_profile() -> None:
     )
 
 
-def test_weekly_profile_learns_a_running_average() -> None:
-    """Real interval samples replace defaults and then form a running average."""
+def test_weekly_profile_averages_samples_and_trims_the_margin() -> None:
+    """Samples for one slot average together, less the 50 W forecast margin."""
     timestamp = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
     profile = WeeklyConsumptionProfile.default()
 
     assert len(profile.values_kwh) == INTERVALS_PER_WEEK
     assert profile.consumption_kwh(timestamp) == ACTIVE_CONSUMPTION_KWH
 
-    profile = profile.record(timestamp, 0.5)
-    assert profile.consumption_kwh(timestamp) == 0.5
+    profile = WeeklyConsumptionProfile.from_samples([(timestamp, 0.5)])
+    assert profile.consumption_kwh(timestamp) == 0.5 - CONSUMPTION_MARGIN_KWH
+    assert profile.sample_counts[weekly_slot_index(timestamp)] == 1
 
-    profile = profile.record(timestamp, 0.25)
-    assert profile.consumption_kwh(timestamp) == 0.375
-    assert WeeklyConsumptionProfile.from_dict(profile.as_dict()) == profile
+    # A second week's sample for the same slot averages with the first.
+    profile = WeeklyConsumptionProfile.from_samples(
+        [(timestamp, 0.5), (timestamp + timedelta(days=7), 0.25)]
+    )
+    assert profile.consumption_kwh(timestamp) == 0.375 - CONSUMPTION_MARGIN_KWH
+    assert profile.sample_counts[weekly_slot_index(timestamp)] == 2
+
+
+def test_weekly_profile_floors_the_margin_at_zero() -> None:
+    """A slot drawing less than the margin forecasts zero, never negative."""
+    timestamp = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
+    profile = WeeklyConsumptionProfile.from_samples(
+        [(timestamp, CONSUMPTION_MARGIN_KWH / 2)]
+    )
+
+    assert profile.consumption_kwh(timestamp) == 0.0
+
+
+def test_weekly_profile_without_samples_keeps_untrimmed_defaults() -> None:
+    """No history at all yields exactly the default profile."""
+    assert WeeklyConsumptionProfile.from_samples([]) == WeeklyConsumptionProfile.default()
+
+
+def test_weekly_profile_covers_only_the_slots_history_supplies() -> None:
+    """Slots the history misses keep their weekday default, margin untouched."""
+    covered = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)  # Monday, a working slot.
+    uncovered = datetime(2026, 9, 7, 3, 0, tzinfo=UTC)  # Monday, an idle slot.
+    profile = WeeklyConsumptionProfile.from_samples([(covered, 0.5)])
+
+    assert profile.consumption_kwh(covered) == 0.5 - CONSUMPTION_MARGIN_KWH
+    assert profile.consumption_kwh(uncovered) == IDLE_CONSUMPTION_KWH
+    assert profile.sample_counts[weekly_slot_index(uncovered)] == 0
 
 
 @pytest.mark.parametrize(
@@ -135,30 +167,20 @@ def test_default_profile_values_are_kwh_per_quarter_hour(
         assert profile.consumption_kwh(timestamp) == expected_kwh
 
 
-@pytest.mark.parametrize("stale_fallback_kwh", [0.015, 1.25])
-def test_profile_load_refreshes_only_unlearned_slots(stale_fallback_kwh) -> None:
-    """Refresh each slot's fallback without mistaking real samples for defaults."""
-    values = [stale_fallback_kwh] * INTERVALS_PER_WEEK
-    counts = [0] * INTERVALS_PER_WEEK
-    learned_slots = {
-        0: (0.015, 1),  # A learned idle value may equal the old fallback.
-        32: (0.45, 3),  # Learned working-hour consumption.
-        33: (0.3125, 2),  # A learned value may equal the current fallback.
-        34: (0.0, 5),  # Zero is also a valid learned consumption value.
-        5 * INTERVALS_PER_DAY + 40: (0.12, 2),  # Learned weekend consumption.
-    }
-    expected_values = list(WeeklyConsumptionProfile.default().values_kwh)
-    for index, (value, count) in learned_slots.items():
-        values[index] = expected_values[index] = value
-        counts[index] = count
-
-    profile = WeeklyConsumptionProfile.from_dict(
-        {"values_kwh": values, "sample_counts": counts}
+def test_weekly_profile_maps_samples_by_local_weekday_and_time() -> None:
+    """Each sample lands in the slot its own local weekday and time name."""
+    monday_0800 = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
+    saturday_1015 = datetime(2026, 9, 12, 10, 15, tzinfo=UTC)
+    profile = WeeklyConsumptionProfile.from_samples(
+        [(monday_0800, 0.5), (saturday_1015, 0.2)]
     )
 
-    assert profile.values_kwh == tuple(expected_values)
-    assert profile.sample_counts == tuple(counts)
-    assert WeeklyConsumptionProfile.from_dict(profile.as_dict()) == profile
+    assert weekly_slot_index(monday_0800) == 32
+    assert weekly_slot_index(saturday_1015) == 5 * INTERVALS_PER_DAY + 41
+    assert profile.consumption_kwh(monday_0800) == 0.5 - CONSUMPTION_MARGIN_KWH
+    assert profile.consumption_kwh(saturday_1015) == 0.2 - CONSUMPTION_MARGIN_KWH
+    # Every other slot is untouched.
+    assert sum(profile.sample_counts) == 2
 
 
 CAPACITY_KWH = 10.0

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -18,6 +18,10 @@ INTERVALS_PER_WEEK = 7 * INTERVALS_PER_DAY
 # Default consumption is energy in kWh per 15-minute slot.
 ACTIVE_CONSUMPTION_KWH = 0.3125  # Average working-hour power of 1.25 kW.
 IDLE_CONSUMPTION_KWH = 0.06  # Average idle power of 240 W.
+# Measured averages are trimmed by a sustained 50 W before they become a
+# forecast, so a discharge sized to the forecast stays under the real load
+# instead of pushing battery energy out to the grid.
+CONSUMPTION_MARGIN_KWH = 0.0125
 MIN_DISCHARGE_PRICE_PER_KWH = 0.13
 CHARGE_PRICE_BAND = 0.25
 PRE_CHARGE_DISCHARGE_PRICE_BAND = 0.50
@@ -113,14 +117,14 @@ class OptimizationPlan:
 
 @dataclass(frozen=True, slots=True)
 class WeeklyConsumptionProfile:
-    """Learned consumption averages for every 15-minute slot of a week."""
+    """Measured consumption averages for every 15-minute slot of a week."""
 
     values_kwh: tuple[float, ...]
     sample_counts: tuple[int, ...]
 
     @classmethod
     def default(cls) -> WeeklyConsumptionProfile:
-        """Create the initial weekday profile before real samples are available."""
+        """Create the weekday profile used where no history is available."""
         values = tuple(
             _default_consumption_for_slot(weekday, slot)
             for weekday in range(7)
@@ -129,59 +133,32 @@ class WeeklyConsumptionProfile:
         return cls(values, (0,) * INTERVALS_PER_WEEK)
 
     @classmethod
-    def from_dict(
-        cls, data: Mapping[str, object] | None
+    def from_samples(
+        cls, samples: Iterable[tuple[datetime, float]]
     ) -> WeeklyConsumptionProfile:
-        """Restore learned values and use current defaults for unlearned slots."""
-        if not data:
-            return cls.default()
-        raw_values = data.get("values_kwh")
-        raw_counts = data.get("sample_counts")
-        if not isinstance(raw_values, list) or not isinstance(raw_counts, list):
-            return cls.default()
-        if (
-            len(raw_values) != INTERVALS_PER_WEEK
-            or len(raw_counts) != INTERVALS_PER_WEEK
-        ):
-            return cls.default()
-        try:
-            values = tuple(max(0.0, float(value)) for value in raw_values)
-            counts = tuple(max(0, int(count)) for count in raw_counts)
-        except (TypeError, ValueError):
-            return cls.default()
+        """Average measured quarter-hour energy into the 672 weekly slots.
+
+        Each sample is one completed quarter hour, keyed by its local start.
+        Slots the history does not cover keep their weekday default, which is
+        left untrimmed because a guess is not a measurement.
+        """
+        totals = [0.0] * INTERVALS_PER_WEEK
+        counts = [0] * INTERVALS_PER_WEEK
+        for timestamp, consumption_kwh in samples:
+            index = weekly_slot_index(timestamp)
+            totals[index] += max(0.0, consumption_kwh)
+            counts[index] += 1
+
         defaults = cls.default().values_kwh
         values = tuple(
-            value if count > 0 else default
-            for value, count, default in zip(values, counts, defaults, strict=True)
+            max(0.0, total / count - CONSUMPTION_MARGIN_KWH) if count else default
+            for total, count, default in zip(totals, counts, defaults, strict=True)
         )
-        return cls(values, counts)
-
-    def as_dict(self) -> dict[str, list[float] | list[int]]:
-        """Serialize the learned profile for Home Assistant storage."""
-        return {
-            "values_kwh": list(self.values_kwh),
-            "sample_counts": list(self.sample_counts),
-        }
+        return cls(values, tuple(counts))
 
     def consumption_kwh(self, timestamp: datetime) -> float:
         """Return typical energy consumption for the timestamp's weekly slot."""
         return self.values_kwh[weekly_slot_index(timestamp)]
-
-    def record(
-        self, timestamp: datetime, consumption_kwh: float
-    ) -> WeeklyConsumptionProfile:
-        """Return a profile with one real sample added to a weekly slot."""
-        index = weekly_slot_index(timestamp)
-        sample_count = self.sample_counts[index]
-        average_kwh = self.values_kwh[index]
-        updated_average_kwh = (
-            average_kwh * sample_count + max(0.0, consumption_kwh)
-        ) / (sample_count + 1)
-        values = list(self.values_kwh)
-        counts = list(self.sample_counts)
-        values[index] = updated_average_kwh
-        counts[index] = sample_count + 1
-        return WeeklyConsumptionProfile(tuple(values), tuple(counts))
 
 
 def weekly_slot_index(timestamp: datetime) -> int:

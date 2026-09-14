@@ -17,9 +17,9 @@ from .const import (
     CONF_CHARGE_EFFICIENCY,
     CONF_CHARGE_POWER_TARGET_ENTITY,
     CONF_CHARGE_PRICE_THRESHOLD,
+    CONF_CONSUMED_ENERGY_ENTITY,
     CONF_DEGRADATION_COST,
     CONF_DISCHARGE_EFFICIENCY,
-    CONF_GRID_IMPORT_ENERGY_ENTITY,
     CONF_MAX_CHARGE_POWER_ENTITY,
     CONF_MAX_DISCHARGE_POWER_ENTITY,
     CONF_MAX_SOC_PERCENT,
@@ -63,8 +63,8 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 default=defaults.get(CONF_MAX_DISCHARGE_POWER_ENTITY),
             ): selector.EntitySelector(),
             vol.Required(
-                CONF_GRID_IMPORT_ENERGY_ENTITY,
-                default=defaults.get(CONF_GRID_IMPORT_ENERGY_ENTITY),
+                CONF_CONSUMED_ENERGY_ENTITY,
+                default=defaults.get(CONF_CONSUMED_ENERGY_ENTITY),
             ): selector.EntitySelector(),
             vol.Required(
                 CONF_CHARGE_POWER_TARGET_ENTITY,

@@ -80,7 +80,6 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             "usable_capacity_kwh": data.usable_capacity_kwh,
             "max_charge_power_kw": data.max_charge_power_kw,
             "max_discharge_power_kw": data.max_discharge_power_kw,
-            "grid_import_energy_kwh": data.grid_import_energy_kwh,
             "optimization_status": (
                 "failed"
                 if data.planning_error
