@@ -23,8 +23,9 @@ realized EPEX savings when that energy is discharged.
 - Monitors cumulative battery charged/discharged energy every 15 minutes and
   publishes the cost of stored energy, total charging costs, and total savings.
 - Rebuilds a 672-slot weekly consumption profile from up to four weeks of
-  recorder history for the house consumption meter and exposes it through the
-  Typical consumption sensor.
+  recorder history for the consumption and battery energy meters, subtracting
+  charging and adding discharging, and exposes it through the Typical consumption
+  sensor.
 - Persists accounting data and meter baselines across Home Assistant restarts.
 
 ## Requirements
@@ -36,12 +37,14 @@ realized EPEX savings when that energy is discharged.
   `end_time`, and `price_per_kwh`.
 - Battery sensors for SOC, usable capacity, power limits, and cumulative charged
   and discharged energy.
-- A cumulative house consumption energy sensor in kWh.
+- A cumulative consumption energy sensor in kWh whose readings include battery
+  charging and are reduced by battery discharge.
 - An `input_number` helper that your battery automation or integration uses as a
   signed power target in Watts.
-- The `recorder` integration enabled, with long enough retention for the
-  consumption sensor to accumulate statistics. DynEnergy averages whatever the
-  recorder still holds; without it the profile stays on its defaults.
+- The `recorder` integration enabled with statistics for the consumption,
+  battery charged energy, and battery discharged energy sensors. DynEnergy
+  averages the complete intervals recorder still holds; without them the
+  profile stays on its defaults.
 
 ## Installation
 
@@ -93,7 +96,7 @@ select the cumulative battery charged and discharged energy sensors.
 | Usable battery capacity entity | kWh | Usable, not nameplate, capacity. |
 | Maximum charging power entity | kW | Physical charge limit. |
 | Maximum discharging power entity | kW | Physical discharge limit. |
-| Cumulative house consumption energy entity | kWh total | Recorder history for this sensor builds the typical weekly consumption profile. |
+| Cumulative metered consumption energy entity | kWh total | Must include battery charging and be reduced by battery discharge; the profile corrects both using the battery counters. |
 | Writable battery power helper | `input_number`, W | Negative charge, positive discharge, zero idle. |
 | Charge price threshold | EUR/kWh | Ceiling on the daily charge threshold; defaults to `0.10`. |
 | Minimum / maximum SOC | Percent | Must be ordered and within 0-100. |
@@ -162,13 +165,35 @@ charge blocks already walked, falling back to the measured `Stored energy cost`
 for the part of the day before the first block.
 
 Household demand comes from a profile of 672 quarter-hour slots, one per
-15 minutes of the week. DynEnergy rebuilds the whole profile from recorder
-statistics for the house consumption entity: at startup and again after each
-nightly plan it reads the last four weeks, or less when the recorder keeps
-less, sums the five-minute `change` values into completed quarter hours, and
-averages every quarter hour onto its weekday-and-time slot. The averages are
-never folded incrementally and nothing is persisted, so each rebuild also
-corrects the day that just finished.
+15 minutes of the week. At startup and before each nightly plan, DynEnergy
+rebuilds the whole profile from up to four weeks of recorder statistics for
+the configured consumption, battery charged energy, and battery discharged
+energy sensors. Shorter recorder retention limits this window.
+
+For every completed quarter hour, the forecast input is:
+
+$$
+E_{house}=\max\left(0,\Delta E_{consumption}
+-\frac{\Delta E_{charged}}{\eta_{charge}}
++\Delta E_{discharged}\eta_{discharge}\right)
+$$
+
+The battery counters measure energy stored in or removed from the battery, so
+the configured efficiencies convert their deltas to energy at the consumption
+meter. With both efficiencies set to 1, this is consumption minus charging plus
+discharging. Battery charging therefore does not inflate learned household
+demand, and a load supplied by the battery does not disappear from next week's
+forecast. The consumption sensor must have the meter behavior described above;
+a sensor already measuring household demand independently of the battery would
+be corrected twice.
+
+All three sensors must have matching sets of three valid five-minute `change`
+readings for a quarter to count. Missing, duplicate, invalid, or negative
+readings cause that quarter to be skipped rather than learned as zero demand.
+Corrected quarter-hour totals are averaged into weekday-and-time slots. The
+averages are rebuilt rather than folded incrementally, so available historical
+data is corrected immediately when the integration starts. The nightly plan
+uses the freshly rebuilt profile.
 
 Measured averages are then trimmed by 0.0125 kWh, a sustained 50 W across the
 slot, before they become a forecast. Discharge is capped at the forecast, so
@@ -178,8 +203,8 @@ pushing energy out to the grid. The trim floors at zero.
 Slots the history does not cover keep their default, untrimmed because a guess
 is not a measurement: 0.3125 kWh (an average 1.25 kW) from Monday to Thursday,
 07:45-18:30, and Friday, 07:45-13:30, and 0.060 kWh (an average 240 W)
-everywhere else. With no consumption entity configured, no recorder, or no
-statistics for the entity, the profile is entirely defaults.
+everywhere else. With a required entity missing, no recorder, or no matching
+statistics for all three meters, the profile is entirely defaults.
 
 ## Entities
 

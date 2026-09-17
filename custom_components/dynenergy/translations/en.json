@@ -9,7 +9,7 @@
     "step": {
       "user": {
         "title": "DynEnergy",
-        "description": "Select the entities DynEnergy uses to plan and control battery charging.",
+        "description": "Select the entities DynEnergy uses to plan and control battery charging. Metered consumption must include battery charging and decrease when the battery supplies the load.",
         "data": {
           "price_entity": "EPEX day-ahead price entity",
           "soc_entity": "Battery state of charge entity",
@@ -19,7 +19,7 @@
           "capacity_entity": "Usable battery capacity entity (kWh)",
           "max_charge_power_entity": "Maximum charging power entity (kW)",
           "max_discharge_power_entity": "Maximum discharging power entity (kW)",
-          "consumed_energy_entity": "Cumulative house consumption energy entity (kWh)",
+          "consumed_energy_entity": "Cumulative metered consumption energy entity (kWh)",
           "charge_power_target_entity": "Writable input_number for battery power (W; negative charges, positive discharges, 0 is idle)",
           "charge_price_threshold": "Charge only below this price (EUR/kWh)",
           "min_soc_percent": "Minimum state of charge (%)",
@@ -31,7 +31,7 @@
       },
       "reconfigure": {
         "title": "DynEnergy",
-        "description": "Update the entities and limits DynEnergy uses to plan and control battery charging.",
+        "description": "Update the entities and limits DynEnergy uses to plan and control battery charging. Metered consumption must include battery charging and decrease when the battery supplies the load.",
         "data": {
           "price_entity": "EPEX day-ahead price entity",
           "soc_entity": "Battery state of charge entity",
@@ -41,7 +41,7 @@
           "capacity_entity": "Usable battery capacity entity (kWh)",
           "max_charge_power_entity": "Maximum charging power entity (kW)",
           "max_discharge_power_entity": "Maximum discharging power entity (kW)",
-          "consumed_energy_entity": "Cumulative house consumption energy entity (kWh)",
+          "consumed_energy_entity": "Cumulative metered consumption energy entity (kWh)",
           "charge_power_target_entity": "Writable input_number for battery power (W; negative charges, positive discharges, 0 is idle)",
           "charge_price_threshold": "Charge only below this price (EUR/kWh)",
           "min_soc_percent": "Minimum state of charge (%)",

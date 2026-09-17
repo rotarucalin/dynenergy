@@ -152,7 +152,7 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(coordinator_module, "Store", store))
         self.enterContext(patch.object(
             coordinator_module, "async_load_consumption_samples",
-            AsyncMock(side_effect=lambda *args: list(self.history_samples)),
+            AsyncMock(side_effect=lambda *args, **kwargs: list(self.history_samples)),
         ))
         self.enterContext(patch.object(coordinator_module.dt_util, "now", return_value=self.now))
         real_coordinator = coordinator_module.DynEnergyCoordinator

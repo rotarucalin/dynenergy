@@ -780,6 +780,51 @@ def test_plan_respects_soc_limits_and_forecast_load() -> None:
     )
 
 
+@pytest.mark.parametrize("learned_evening_kwh", [None, 0.0])
+def test_afternoon_start_prioritizes_evening_peak_unless_learned_load_is_zero(
+    learned_evening_kwh,
+) -> None:
+    """A zero-load forecast can leave a 19:15-20:30 gap with charge remaining."""
+    start = datetime(2026, 9, 17, 14, tzinfo=UTC)
+    timestamps = [start + timedelta(minutes=15 * index) for index in range(40)]
+    # Synthetic afternoon horizon: charge, wait, then an evening peak at 19:45.
+    prices = [0.01] * 8 + [0.10] * 7 + [0.20] * 6 + [0.21] * 5 + [0.20] * 14
+    prices[23] = 0.23
+    profile = WeeklyConsumptionProfile.default()
+    if learned_evening_kwh is not None:
+        profile = WeeklyConsumptionProfile.from_samples(
+            (timestamp, learned_evening_kwh) for timestamp in timestamps[21:26]
+        )
+    inputs = OptimizerInputs(
+        timestamps=timestamps,
+        prices_per_kwh=prices,
+        consumption_kwh=[profile.consumption_kwh(timestamp) for timestamp in timestamps],
+        current_soc_percent=19,
+        battery=_small_battery(charge_efficiency=0.95, discharge_efficiency=0.95),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+    peak = plan.intervals[23]
+
+    assert peak.timestamp.hour == 19 and peak.timestamp.minute == 45
+    assert peak.price_per_kwh == max(prices)
+    assert plan.intervals[14].expected_soc_percent == pytest.approx(100)
+    assert plan.intervals[20].expected_soc_percent > MIN_SOC_PERCENT
+    assert plan.intervals[-1].expected_soc_percent == pytest.approx(MIN_SOC_PERCENT)
+    assert plan.intervals[26].state is OperatingState.DISCHARGE
+    assert plan.summary.spike_discharge_kwh == 0
+    if learned_evening_kwh is None:
+        # Scarce energy is reserved for the peak even with earlier demand.
+        assert peak.target_battery_energy_kwh == pytest.approx(IDLE_CONSUMPTION_KWH)
+        assert all(i.state is OperatingState.DISCHARGE for i in plan.intervals[21:26])
+    else:
+        # Being the daily maximum does not override a learned zero-demand slot.
+        assert all(i.state is OperatingState.IDLE for i in plan.intervals[21:26])
+        assert all(
+            i.expected_soc_percent == pytest.approx(plan.intervals[20].expected_soc_percent)
+            for i in plan.intervals[21:26]
+        )
+
+
 def test_price_spike_discharges_above_the_forecast_load() -> None:
     """A price far above the cost basis runs the battery at full power."""
     plan = create_greedy_charge_plan(

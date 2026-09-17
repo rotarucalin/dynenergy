@@ -166,9 +166,11 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
 
     async def _async_create_next_day_plan(self, now: datetime) -> None:
         """Refresh EPEX data and generate tomorrow's plan at 23:50 local time."""
-        await self._async_refresh_plan(dt_util.as_local(now).date() + timedelta(days=1))
+        if self._shutting_down:
+            return
+        await self._async_refresh_consumption_profile()
         if not self._shutting_down:
-            await self._async_refresh_consumption_profile()
+            await self._async_refresh_plan(dt_util.as_local(now).date() + timedelta(days=1))
 
     async def _async_restore_plan(self) -> None:
         """Restore a plan once its inputs are ready, without blocking startup."""
@@ -392,6 +394,10 @@ class DynEnergyCoordinator(DataUpdateCoordinator[DynEnergyData]):
             self.hass,
             self.entry.data.get(CONF_CONSUMED_ENERGY_ENTITY),
             CONSUMPTION_HISTORY_DAYS,
+            charged_entity_id=self.entry.data.get(CONF_BATTERY_CHARGED_ENERGY_ENTITY),
+            discharged_entity_id=self.entry.data.get(CONF_BATTERY_DISCHARGED_ENERGY_ENTITY),
+            charge_efficiency=float(self.entry.data.get(CONF_CHARGE_EFFICIENCY, 0.95)),
+            discharge_efficiency=float(self.entry.data.get(CONF_DISCHARGE_EFFICIENCY, 0.95)),
         )
         self._consumption_profile = optimizer.WeeklyConsumptionProfile.from_samples(
             samples

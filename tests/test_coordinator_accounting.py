@@ -672,40 +672,68 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
         await coordinator._async_run_interval_tasks(self.start)
         self.assertEqual(calls, ["accounting", "applying"])
 
-    async def test_nightly_plan_refreshes_the_consumption_profile_afterwards(self):
-        """Tomorrow's plan is built first, then today's actuals correct the profile."""
+    async def test_nightly_plan_uses_the_refreshed_consumption_profile(self):
+        """Tomorrow's plan sees the latest history, not yesterday's profile."""
         coordinator = self.coordinator
         calls = []
-        coordinator._async_refresh_plan = AsyncMock(
-            side_effect=lambda *args, **kwargs: calls.append("plan")
-        )
+        refreshed = WeeklyConsumptionProfile.from_samples([(self.start, 0.5)])
+
+        async def refresh_profile():
+            coordinator._consumption_profile = refreshed
+            calls.append("profile")
+
+        async def create_plan(*args, **kwargs):
+            self.assertIs(coordinator._consumption_profile, refreshed)
+            calls.append("plan")
+
+        coordinator._async_refresh_plan = AsyncMock(side_effect=create_plan)
         coordinator._async_refresh_consumption_profile = AsyncMock(
-            side_effect=lambda: calls.append("profile")
+            side_effect=refresh_profile
         )
 
         await coordinator._async_create_next_day_plan(self.start)
 
-        self.assertEqual(calls, ["plan", "profile"])
+        self.assertEqual(calls, ["profile", "plan"])
         target_date, = coordinator._async_refresh_plan.await_args.args
         self.assertEqual(target_date, self.start.date() + timedelta(days=1))
 
-    async def test_shutdown_during_nightly_planning_skips_the_profile_refresh(self):
-        """A teardown mid-plan must not start another recorder read."""
+    async def test_shutdown_during_profile_refresh_skips_nightly_planning(self):
+        """A teardown during the history read must not start a new plan."""
         coordinator = self.coordinator
 
         async def refresh_then_shut_down(*args, **kwargs):
             coordinator._shutting_down = True
 
-        coordinator._async_refresh_plan = AsyncMock(side_effect=refresh_then_shut_down)
+        coordinator._async_refresh_plan = AsyncMock()
+        coordinator._async_refresh_consumption_profile = AsyncMock(
+            side_effect=refresh_then_shut_down
+        )
+
+        await coordinator._async_create_next_day_plan(self.start)
+
+        coordinator._async_refresh_plan.assert_not_awaited()
+
+    async def test_shutdown_skips_nightly_history_and_planning(self):
+        coordinator = self.coordinator
+        coordinator._shutting_down = True
+        coordinator._async_refresh_plan = AsyncMock()
         coordinator._async_refresh_consumption_profile = AsyncMock()
 
         await coordinator._async_create_next_day_plan(self.start)
 
+        coordinator._async_refresh_plan.assert_not_awaited()
         coordinator._async_refresh_consumption_profile.assert_not_awaited()
 
     async def test_profile_refresh_reads_the_configured_consumption_entity(self):
-        """The rebuild passes the configured entity and the four-week cap through."""
+        """The rebuild uses both battery counters and the configured efficiencies."""
         coordinator = self.coordinator
+        coordinator.entry.data.update({
+            "consumed_energy_entity": "sensor.house_total",
+            "battery_charged_energy_entity": "sensor.battery_charged",
+            "battery_discharged_energy_entity": "sensor.battery_discharged",
+            "charge_efficiency": 0.8,
+            "discharge_efficiency": 0.9,
+        })
         samples = [(self.start, 0.5)]
         with patch.object(
             coordinator_module,
@@ -717,6 +745,12 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
         _hass, entity_id, max_days = load.await_args.args
         self.assertEqual(entity_id, coordinator.entry.data.get("consumed_energy_entity"))
         self.assertEqual(max_days, coordinator_module.CONSUMPTION_HISTORY_DAYS)
+        self.assertEqual(load.await_args.kwargs, {
+            "charged_entity_id": "sensor.battery_charged",
+            "discharged_entity_id": "sensor.battery_discharged",
+            "charge_efficiency": 0.8,
+            "discharge_efficiency": 0.9,
+        })
         self.assertEqual(
             coordinator._consumption_profile,
             WeeklyConsumptionProfile.from_samples(samples),

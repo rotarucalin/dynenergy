@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import TYPE_CHECKING
 
 from homeassistant.util import dt as dt_util
@@ -21,16 +22,27 @@ _STATISTICS_PERIOD = "5minute"
 
 
 async def async_load_consumption_samples(
-    hass: HomeAssistant, entity_id: str | None, max_days: int
+    hass: HomeAssistant,
+    entity_id: str | None,
+    max_days: int,
+    *,
+    charged_entity_id: str | None,
+    discharged_entity_id: str | None,
+    charge_efficiency: float,
+    discharge_efficiency: float,
 ) -> list[tuple[datetime, float]]:
-    """Return completed quarter-hour consumption totals from recorder history.
+    """Return quarter-hour demand with the battery's effect on the meter removed.
 
-    Each item is the local start of a quarter hour and the energy the house
-    consumed during it. Returns an empty list whenever the history cannot be
-    read, which leaves the caller with the default weekday profile.
+    The consumption meter includes charging and is reduced by battery discharge.
+    Convert battery-side energy changes to AC energy before subtracting charging
+    and adding discharge. Only complete, matching quarters from all three
+    meters can become profile samples.
     """
-    if not entity_id:
-        LOGGER.debug("No consumption entity configured; skipping history load")
+    if not all((entity_id, charged_entity_id, discharged_entity_id)):
+        LOGGER.warning("Consumption and battery energy entities are required for history")
+        return []
+    if not (0 < charge_efficiency <= 1 and 0 < discharge_efficiency <= 1):
+        LOGGER.warning("Invalid battery efficiencies; using the default consumption profile")
         return []
 
     try:
@@ -62,7 +74,7 @@ async def async_load_consumption_samples(
             hass,
             start,
             end,
-            {entity_id},
+            {entity_id, charged_entity_id, discharged_entity_id},
             _STATISTICS_PERIOD,
             {"energy": "kWh"},
             {"change"},
@@ -71,32 +83,58 @@ async def async_load_consumption_samples(
         LOGGER.exception("Could not read consumption history for %s", entity_id)
         return []
 
-    rows = statistics.get(entity_id) or []
-    if not rows:
+    consumption = _quarter_hour_totals(statistics.get(entity_id) or [])
+    charged = _quarter_hour_totals(statistics.get(charged_entity_id) or [])
+    discharged = _quarter_hour_totals(statistics.get(discharged_entity_id) or [])
+    shared_starts = consumption.keys() & charged.keys() & discharged.keys()
+    samples = [
+        (
+            dt_util.as_local(dt_util.utc_from_timestamp(timestamp)),
+            max(
+                0.0,
+                consumption[timestamp]
+                - charged[timestamp] / charge_efficiency
+                + discharged[timestamp] * discharge_efficiency,
+            ),
+        )
+        for timestamp in sorted(shared_starts)
+        if start.timestamp() <= timestamp
+        and timestamp + optimizer.INTERVAL_MINUTES * 60 <= end.timestamp()
+    ]
+    if not samples:
         LOGGER.warning(
-            "No recorder statistics for %s; using the default consumption profile",
+            "No complete matching consumption/battery history for %s; "
+            "using the default consumption profile",
             entity_id,
         )
-        return []
-
-    return _quarter_hour_totals(rows)
+    return samples
 
 
-def _quarter_hour_totals(rows: list[dict]) -> list[tuple[datetime, float]]:
-    """Collapse five-minute statistic rows into local quarter-hour totals."""
-    totals: dict[datetime, float] = {}
+def _quarter_hour_totals(rows: list[dict]) -> dict[int, float]:
+    """Sum quarters with three valid five-minute rows, keyed by UTC timestamp."""
+    changes: dict[int, float] = {}
+    duplicates: set[int] = set()
     for row in rows:
-        change = row.get("change")
-        start = row.get("start")
-        if change is None or start is None:
+        try:
+            change = float(row["change"])
+            timestamp = float(row["start"])
+        except (KeyError, TypeError, ValueError):
             continue
-        local_start = dt_util.as_local(dt_util.utc_from_timestamp(start))
-        slot_start = local_start.replace(
-            minute=local_start.minute
-            // optimizer.INTERVAL_MINUTES
-            * optimizer.INTERVAL_MINUTES,
-            second=0,
-            microsecond=0,
-        )
-        totals[slot_start] = totals.get(slot_start, 0.0) + max(0.0, float(change))
-    return sorted(totals.items())
+        if (
+            not isfinite(change) or change < 0
+            or not isfinite(timestamp) or timestamp % (5 * 60) != 0
+        ):
+            continue
+        key = int(timestamp)
+        if key in changes:
+            duplicates.add(key)
+        changes[key] = change
+
+    totals: dict[int, float] = {}
+    for timestamp in changes:
+        if timestamp % (optimizer.INTERVAL_MINUTES * 60) != 0:
+            continue
+        parts = [timestamp + offset * 60 for offset in (0, 5, 10)]
+        if all(part in changes and part not in duplicates for part in parts):
+            totals[timestamp] = sum(changes[part] for part in parts)
+    return totals
