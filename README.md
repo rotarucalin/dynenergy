@@ -130,8 +130,9 @@ intervals priced strictly below $T_{charge}$ and the discharge gaps around them,
 then walked in order, so a day with a cheap night and a cheap midday runs two
 charge and discharge cycles. Each gap is planned against the block that follows
 it: when that block can refill the battery on its own the gap may empty it down
-to minimum SOC, otherwise energy is held back for $T_{pre}$. The final gap, with
-no block after it, uses $T_{post}$.
+to minimum SOC, but ordinary discharge still requires at least 13 ct/kWh and
+must cover the refill cost, round-trip losses, and degradation. Otherwise energy
+is held back for $T_{pre}$. The final gap, with no block after it, uses $T_{post}$.
 
 Before charging a block, DynEnergy checks later cheaper buckets. It skips the
 earlier block when a later bucket can cover the remaining deficit plus margin

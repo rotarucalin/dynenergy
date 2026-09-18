@@ -583,6 +583,61 @@ def test_earlier_expensive_block_waits_for_sufficient_cheaper_bucket(charge_effi
     assert plan.summary.total_charge_kwh == pytest.approx(1.62 / charge_efficiency)
 
 
+@pytest.mark.parametrize("efficiency", [1.0, 0.95])
+def test_small_late_morning_dip_waits_for_midday_charging(efficiency) -> None:
+    """A brief threshold crossing must not create a charge/discharge pair at 11."""
+    prices = _prices(
+        (43, 0.10), (1, 0.05), (1, 0.06), (5, 0.04),
+        (16, 0.001), (6, 0.10), (24, 0.20),
+    )
+    prices[32] = 0.22  # Morning peak empties the opening charge at 08:00.
+    inputs = _inputs(prices, current_soc_percent=19, battery=_small_battery(
+        charge_efficiency=efficiency, discharge_efficiency=efficiency,
+    ))
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert plan.intervals[32].state is OperatingState.DISCHARGE
+    assert plan.intervals[32].expected_soc_percent == pytest.approx(MIN_SOC_PERCENT)
+    assert all(i.state is OperatingState.IDLE for i in plan.intervals[43:50])
+    assert all(
+        i.target_battery_energy_kwh == pytest.approx(-2.2 / efficiency / 16)
+        for i in plan.intervals[50:66]
+    )
+    assert plan.intervals[65].expected_soc_percent == pytest.approx(MAX_SOC_PERCENT)
+    assert any(i.state is OperatingState.DISCHARGE for i in plan.intervals[72:])
+    assert plan.summary.highest_charge_price_per_kwh == 0.001
+    assert plan.summary.total_charge_kwh == pytest.approx(1.8 / efficiency)
+
+
+@pytest.mark.parametrize(
+    "refill_price, efficiency, degradation, gap_price, expected_state",
+    [
+        (0.001, 1.0, 0.0, 0.1299, OperatingState.IDLE),
+        (0.001, 1.0, 0.0, 0.13, OperatingState.DISCHARGE),
+        (0.08, 0.8, 0.02, 0.14, OperatingState.IDLE),
+        (0.08, 0.8, 0.02, 0.15, OperatingState.DISCHARGE),
+    ],
+)
+def test_guaranteed_refill_respects_discharge_minimum_and_break_even(
+    refill_price, efficiency, degradation, gap_price, expected_state,
+) -> None:
+    """A full refill relaxes the daily band, but keeps the price and cost floors."""
+    inputs = _inputs(
+        [gap_price] + [refill_price] * 16 + [0.40],
+        current_soc_percent=50,
+        stored_energy_cost_per_kwh=0.10,
+        battery=_small_battery(
+            charge_efficiency=efficiency,
+            discharge_efficiency=efficiency,
+            degradation_cost_per_kwh=degradation,
+        ),
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert plan.summary.full_charge_feasible
+    assert plan.intervals[0].state is expected_state
+
+
 def test_lookahead_crosses_more_than_one_later_block() -> None:
     """An insufficient intermediate dip does not hide the later sufficient bucket."""
     prices = [0.045] * 8 + [0.10] + [0.025] + [0.10] + [0.005] * 8 + [0.30]

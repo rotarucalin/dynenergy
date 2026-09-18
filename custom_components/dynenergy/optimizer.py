@@ -422,7 +422,13 @@ def _discharge_floor_per_kwh(
 
     next_block = blocks[position]
     if _refill_capability_kwh(inputs, next_block) >= refill_needed_kwh:
-        return _break_even_price_per_kwh(inputs, next_block, refill_needed_kwh)
+        # A guaranteed refill relaxes the daily price band, not the minimum
+        # discharge price. Otherwise a small dip can trigger an unnecessary
+        # charge/discharge cycle just before the main cheap charging window.
+        return max(
+            MIN_DISCHARGE_PRICE_PER_KWH,
+            _break_even_price_per_kwh(inputs, next_block, refill_needed_kwh),
+        )
     return thresholds.pre_charge_discharge_per_kwh
 
 
