@@ -255,8 +255,8 @@ class ConsumptionHistoryTests(unittest.IsolatedAsyncioTestCase):
         samples, _ = await self._load(Mock(return_value=statistics), discharge_efficiency=0.8)
         profile = optimizer.WeeklyConsumptionProfile.from_samples(samples)
         next_peak = previous_peak + timedelta(days=7)
-        # 0.075 kWh from the battery delivers 0.060 kWh; trim the margin once.
-        expected_kwh = 0.060 - optimizer.CONSUMPTION_MARGIN_KWH
+        # 0.075 kWh from the battery delivers the full 0.060 kWh forecast.
+        expected_kwh = 0.060
         self.assertAlmostEqual(profile.consumption_kwh(next_peak), expected_kwh)
         timestamps = [next_peak - timedelta(minutes=15), next_peak, next_peak + timedelta(minutes=15)]
         plan = optimizer.create_greedy_charge_plan(
@@ -264,7 +264,7 @@ class ConsumptionHistoryTests(unittest.IsolatedAsyncioTestCase):
                 timestamps=timestamps,
                 prices_per_kwh=[0.20, 0.23, 0.20],
                 consumption_kwh=[profile.consumption_kwh(timestamp) for timestamp in timestamps],
-                current_soc_percent=13,
+                current_soc_percent=14,  # Enough stored energy for the full load.
                 battery=optimizer.BatteryParameters(
                     usable_capacity_kwh=2.0,
                     max_charge_power_kw=1.5, max_discharge_power_kw=1.5,
@@ -277,7 +277,7 @@ class ConsumptionHistoryTests(unittest.IsolatedAsyncioTestCase):
         peak = plan.intervals[1]
         self.assertIs(peak.state, optimizer.OperatingState.DISCHARGE)
         self.assertAlmostEqual(peak.target_battery_energy_kwh, expected_kwh)
-        self.assertAlmostEqual(peak.target_battery_energy_kwh / optimizer.INTERVAL_HOURS * 1000, 190)
+        self.assertAlmostEqual(peak.target_battery_energy_kwh / optimizer.INTERVAL_HOURS * 1000, 240)
 
     async def test_window_is_clamped_to_the_shorter_of_retention_and_maximum(self):
         """Recorder retention caps the window; four weeks caps recorder retention."""

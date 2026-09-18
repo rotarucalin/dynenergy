@@ -191,20 +191,27 @@ be corrected twice.
 All three sensors must have matching sets of three valid five-minute `change`
 readings for a quarter to count. Missing, duplicate, invalid, or negative
 readings cause that quarter to be skipped rather than learned as zero demand.
-Corrected quarter-hour totals are averaged into weekday-and-time slots. The
-averages are rebuilt rather than folded incrementally, so available historical
-data is corrected immediately when the integration starts. The nightly plan
-uses the freshly rebuilt profile.
+During scheduled working hours (Monday to Thursday, 07:45-18:30, and Friday,
+07:45-13:30), corrected quarter-hour totals are averaged into weekday-and-time
+slots. Working-hour slots without history use 0.3125 kWh (1.25 kW).
 
-Measured averages are then trimmed by 0.0125 kWh, a sustained 50 W across the
-slot, before they become a forecast. Discharge is capped at the forecast, so
-the trim keeps the battery slightly under the real house draw instead of
-pushing energy out to the grid. The trim floors at zero.
+All other slots share one idle consumption level: the arithmetic mean of all
+valid, battery-corrected idle quarters outside 08:00-18:00 local time in the
+history window. Working-hour samples are also excluded, including weekday
+07:45-08:00 and Monday-to-Thursday 18:00-18:30. Each eligible quarter has equal
+weight, even when some weekly slots have more history than others. Daytime
+solar dips therefore cannot lower the learned idle level.
 
-Slots the history does not cover keep their default, untrimmed because a guess
-is not a measurement: 0.3125 kWh (an average 1.25 kW) from Monday to Thursday,
-07:45-18:30, and Friday, 07:45-13:30, and 0.060 kWh (an average 240 W)
-everywhere else. With a required entity missing, no recorder, or no matching
+The learned constant replaces every idle section in the weekly graph and the
+battery planning profile, including Friday afternoons, daytime weekends, and
+idle slots without their own history. If there are no eligible idle samples,
+it uses 0.060 kWh (240 W); a measured zero remains zero. The full profile is
+rebuilt at startup and before each nightly plan.
+
+Measured averages become the forecast directly, with no fixed power deduction.
+Normal discharge is capped at that forecast.
+
+With a required entity missing, no recorder, or no matching
 statistics for all three meters, the profile is entirely defaults.
 
 ## Entities
@@ -215,7 +222,7 @@ DynEnergy creates these sensors:
 |---|---|---|
 | Battery plan | EUR | Expected daily EPEX saving from the current day-ahead plan. Its attributes contain the full schedule, plan summary, source readings, and status. |
 | Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
-| Typical consumption | W | Forecast demand for the current weekly slot. Its attributes contain all 672 weekly values and how many history samples each one averages. |
+| Typical consumption | W | Forecast demand for the current weekly slot. Attributes contain all 672 weekly values, observed history counts per slot (`sample_counts`), the shared idle level (`idle_consumption_w`), and the number of eligible quarters behind it (`idle_sample_count`). |
 | Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. Its attributes add the stored energy, the total charged energy, and the lifetime average price paid per charged kWh. |
 | Total costs | EUR | Cumulative EPEX value of actual measured battery charging. |
 | Total savings | EUR | Cumulative EPEX value of actual measured battery discharge. |
@@ -321,8 +328,8 @@ disconnected from automatic control first.
 ## Current Limitations
 
 - The consumption profile is only as good as the recorder history behind it.
-  Slots the recorder does not cover fall back to flat defaults, and a fresh
-  install or a short retention window leaves most of the week on those defaults.
+  Uncovered working-hour slots use defaults. Idle slots share the learned
+  constant, or the 240 W default when no eligible idle history exists.
 - Discharge only offsets modeled household demand. Export optimization is out of
   scope.
 - The plan is generated once daily and assumes the current SOC is the opening

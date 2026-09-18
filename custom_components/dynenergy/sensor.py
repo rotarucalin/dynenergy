@@ -210,7 +210,7 @@ class DynEnergyTypicalConsumptionSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
-        """Expose all 672 weekly consumption averages and sample counts."""
+        """Expose the weekly profile, observed slot counts, and idle estimate."""
         profile = self.coordinator.data.consumption_profile
         weekly_profile_w: dict[str, list[int]] = {}
         sample_counts: dict[str, list[int]] = {}
@@ -226,6 +226,10 @@ class DynEnergyTypicalConsumptionSensor(
             "interval_minutes": int(optimizer.INTERVAL_HOURS * 60),
             "weekly_profile_w": weekly_profile_w,
             "sample_counts": sample_counts,
+            "idle_consumption_w": round(
+                profile.idle_consumption_kwh / optimizer.INTERVAL_HOURS * 1000
+            ),
+            "idle_sample_count": profile.idle_sample_count,
         }
 
 

@@ -1,14 +1,13 @@
 """Regression tests for DynEnergy optimizer output conversions."""
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from custom_components.dynenergy.optimizer import (
     ACTIVE_CONSUMPTION_KWH,
     CHARGE_MARGIN_FRACTION,
-    CONSUMPTION_MARGIN_KWH,
     IDLE_CONSUMPTION_KWH,
     INTERVAL_HOURS,
     INTERVALS_PER_DAY,
@@ -99,8 +98,8 @@ def test_default_weekly_consumption_profile() -> None:
     )
 
 
-def test_weekly_profile_averages_samples_and_trims_the_margin() -> None:
-    """Samples for one slot average together, less the 50 W forecast margin."""
+def test_weekly_profile_averages_samples_without_a_deduction() -> None:
+    """Samples for one slot retain their full measured average."""
     timestamp = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
     profile = WeeklyConsumptionProfile.default()
 
@@ -108,39 +107,40 @@ def test_weekly_profile_averages_samples_and_trims_the_margin() -> None:
     assert profile.consumption_kwh(timestamp) == ACTIVE_CONSUMPTION_KWH
 
     profile = WeeklyConsumptionProfile.from_samples([(timestamp, 0.5)])
-    assert profile.consumption_kwh(timestamp) == 0.5 - CONSUMPTION_MARGIN_KWH
+    assert profile.consumption_kwh(timestamp) == 0.5
     assert profile.sample_counts[weekly_slot_index(timestamp)] == 1
 
     # A second week's sample for the same slot averages with the first.
     profile = WeeklyConsumptionProfile.from_samples(
         [(timestamp, 0.5), (timestamp + timedelta(days=7), 0.25)]
     )
-    assert profile.consumption_kwh(timestamp) == 0.375 - CONSUMPTION_MARGIN_KWH
+    assert profile.consumption_kwh(timestamp) == 0.375
     assert profile.sample_counts[weekly_slot_index(timestamp)] == 2
 
 
-def test_weekly_profile_floors_the_margin_at_zero() -> None:
-    """A slot drawing less than the margin forecasts zero, never negative."""
+@pytest.mark.parametrize("consumption_kwh", [0.0, 0.00625, 0.0125])
+def test_weekly_profile_preserves_small_loads(consumption_kwh: float) -> None:
+    """Measured loads at or below 50 W are no longer reduced to zero."""
     timestamp = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
     profile = WeeklyConsumptionProfile.from_samples(
-        [(timestamp, CONSUMPTION_MARGIN_KWH / 2)]
+        [(timestamp, consumption_kwh)]
     )
 
-    assert profile.consumption_kwh(timestamp) == 0.0
+    assert profile.consumption_kwh(timestamp) == consumption_kwh
 
 
-def test_weekly_profile_without_samples_keeps_untrimmed_defaults() -> None:
+def test_weekly_profile_without_samples_keeps_defaults() -> None:
     """No history at all yields exactly the default profile."""
     assert WeeklyConsumptionProfile.from_samples([]) == WeeklyConsumptionProfile.default()
 
 
 def test_weekly_profile_covers_only_the_slots_history_supplies() -> None:
-    """Slots the history misses keep their weekday default, margin untouched."""
+    """Slots the history misses keep their weekday default."""
     covered = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)  # Monday, a working slot.
     uncovered = datetime(2026, 9, 7, 3, 0, tzinfo=UTC)  # Monday, an idle slot.
     profile = WeeklyConsumptionProfile.from_samples([(covered, 0.5)])
 
-    assert profile.consumption_kwh(covered) == 0.5 - CONSUMPTION_MARGIN_KWH
+    assert profile.consumption_kwh(covered) == 0.5
     assert profile.consumption_kwh(uncovered) == IDLE_CONSUMPTION_KWH
     assert profile.sample_counts[weekly_slot_index(uncovered)] == 0
 
@@ -168,7 +168,7 @@ def test_default_profile_values_are_kwh_per_quarter_hour(
 
 
 def test_weekly_profile_maps_samples_by_local_weekday_and_time() -> None:
-    """Each sample lands in the slot its own local weekday and time name."""
+    """Counts use local slots; daytime idle data cannot replace the fallback."""
     monday_0800 = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
     saturday_1015 = datetime(2026, 9, 12, 10, 15, tzinfo=UTC)
     profile = WeeklyConsumptionProfile.from_samples(
@@ -177,10 +177,73 @@ def test_weekly_profile_maps_samples_by_local_weekday_and_time() -> None:
 
     assert weekly_slot_index(monday_0800) == 32
     assert weekly_slot_index(saturday_1015) == 5 * INTERVALS_PER_DAY + 41
-    assert profile.consumption_kwh(monday_0800) == 0.5 - CONSUMPTION_MARGIN_KWH
-    assert profile.consumption_kwh(saturday_1015) == 0.2 - CONSUMPTION_MARGIN_KWH
-    # Every other slot is untouched.
+    assert profile.consumption_kwh(monday_0800) == 0.5
+    assert profile.consumption_kwh(saturday_1015) == IDLE_CONSUMPTION_KWH
+    assert profile.sample_counts[weekly_slot_index(saturday_1015)] == 1
+    assert profile.idle_sample_count == 0
     assert sum(profile.sample_counts) == 2
+
+
+def test_weekly_profile_uses_one_sample_weighted_idle_average() -> None:
+    """Night samples set all idle slots, even where solar or no history exists."""
+    monday = datetime(2026, 9, 7, tzinfo=UTC)
+    profile = WeeklyConsumptionProfile.from_samples(iter([
+        (monday, 0.03),
+        (monday + timedelta(days=7), 0.06),
+        (monday + timedelta(days=1), 0.12),
+        (monday.replace(hour=10), 0.5),
+        (monday.replace(hour=10) + timedelta(days=7), 1.0),
+        (monday + timedelta(days=4, hours=14), 0.0),
+        (monday + timedelta(days=5, hours=12), 0.0),
+    ]))
+
+    # Three equally weighted quarters average to 0.07 kWh / 280 W.
+    assert profile.idle_consumption_kwh == pytest.approx(0.07)
+    assert profile.idle_sample_count == 3
+    for weekday, active_start, active_end in [
+        (0, 31, 74), (1, 31, 74), (2, 31, 74), (3, 31, 74),
+        (4, 31, 54), (5, 0, 0), (6, 0, 0),
+    ]:
+        for slot in range(INTERVALS_PER_DAY):
+            if not active_start <= slot < active_end:
+                assert profile.values_kwh[weekday * 96 + slot] == pytest.approx(0.07)
+    assert profile.consumption_kwh(monday.replace(hour=10)) == 0.75
+    assert profile.consumption_kwh(monday.replace(hour=11)) == ACTIVE_CONSUMPTION_KWH
+    # Counts still describe actual observations, including excluded daytime ones.
+    assert profile.sample_counts[0] == 2
+    assert profile.sample_counts[1] == 0
+    assert sum(profile.sample_counts) == 7
+
+
+@pytest.mark.parametrize("weekday,hour,minute,eligible", [
+    (0, 7, 30, True), (0, 7, 45, False), (0, 8, 0, False),
+    (0, 18, 0, False), (0, 18, 15, False), (0, 18, 30, True),
+    (4, 13, 30, False), (4, 17, 45, False), (4, 18, 0, True),
+    (5, 7, 45, True), (5, 8, 0, False),
+    (5, 17, 45, False), (5, 18, 0, True),
+])
+def test_idle_learning_respects_local_solar_and_working_boundaries(
+    weekday, hour, minute, eligible,
+) -> None:
+    """08:00 is excluded, 18:00 is eligible only when work has ended."""
+    monday = datetime(2026, 9, 7, tzinfo=timezone(timedelta(hours=2)))
+    candidate = monday + timedelta(days=weekday, hours=hour, minutes=minute)
+    profile = WeeklyConsumptionProfile.from_samples([(monday, 0.06), (candidate, 0.10)])
+
+    assert profile.idle_sample_count == (2 if eligible else 1)
+    assert profile.idle_consumption_kwh == pytest.approx(0.08 if eligible else 0.06)
+    assert profile.values_kwh[0] == profile.idle_consumption_kwh
+
+
+@pytest.mark.parametrize("idle_kwh", [0.0, 0.00625])
+def test_learned_idle_can_be_zero_or_below_the_default(idle_kwh: float) -> None:
+    """A measured zero or small idle load is retained without a floor or margin."""
+    night = datetime(2026, 9, 7, 2, tzinfo=UTC)
+    profile = WeeklyConsumptionProfile.from_samples([(night, idle_kwh)])
+
+    assert profile.idle_sample_count == 1
+    assert profile.idle_consumption_kwh == idle_kwh
+    assert profile.consumption_kwh(night + timedelta(days=5, hours=10)) == idle_kwh
 
 
 CAPACITY_KWH = 10.0
@@ -845,15 +908,13 @@ def test_afternoon_start_prioritizes_evening_peak_unless_learned_load_is_zero(
     # Synthetic afternoon horizon: charge, wait, then an evening peak at 19:45.
     prices = [0.01] * 8 + [0.10] * 7 + [0.20] * 6 + [0.21] * 5 + [0.20] * 14
     prices[23] = 0.23
-    profile = WeeklyConsumptionProfile.default()
+    consumption = [default_consumption_kwh(timestamp) for timestamp in timestamps]
     if learned_evening_kwh is not None:
-        profile = WeeklyConsumptionProfile.from_samples(
-            (timestamp, learned_evening_kwh) for timestamp in timestamps[21:26]
-        )
+        consumption[21:26] = [learned_evening_kwh] * 5
     inputs = OptimizerInputs(
         timestamps=timestamps,
         prices_per_kwh=prices,
-        consumption_kwh=[profile.consumption_kwh(timestamp) for timestamp in timestamps],
+        consumption_kwh=consumption,
         current_soc_percent=19,
         battery=_small_battery(charge_efficiency=0.95, discharge_efficiency=0.95),
     )

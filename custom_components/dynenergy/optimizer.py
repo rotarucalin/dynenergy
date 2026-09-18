@@ -18,10 +18,6 @@ INTERVALS_PER_WEEK = 7 * INTERVALS_PER_DAY
 # Default consumption is energy in kWh per 15-minute slot.
 ACTIVE_CONSUMPTION_KWH = 0.3125  # Average working-hour power of 1.25 kW.
 IDLE_CONSUMPTION_KWH = 0.06  # Average idle power of 240 W.
-# Measured averages are trimmed by a sustained 50 W before they become a
-# forecast, so a discharge sized to the forecast stays under the real load
-# instead of pushing battery energy out to the grid.
-CONSUMPTION_MARGIN_KWH = 0.0125
 MIN_DISCHARGE_PRICE_PER_KWH = 0.13
 CHARGE_PRICE_BAND = 0.25
 PRE_CHARGE_DISCHARGE_PRICE_BAND = 0.50
@@ -117,10 +113,13 @@ class OptimizationPlan:
 
 @dataclass(frozen=True, slots=True)
 class WeeklyConsumptionProfile:
-    """Measured consumption averages for every 15-minute slot of a week."""
+    """Weekly working-hour averages and a shared learned idle consumption."""
 
     values_kwh: tuple[float, ...]
+    # Observed quarters per weekly slot, including those excluded from idle learning.
     sample_counts: tuple[int, ...]
+    idle_consumption_kwh: float = IDLE_CONSUMPTION_KWH
+    idle_sample_count: int = 0
 
     @classmethod
     def default(cls) -> WeeklyConsumptionProfile:
@@ -130,31 +129,44 @@ class WeeklyConsumptionProfile:
             for weekday in range(7)
             for slot in range(INTERVALS_PER_DAY)
         )
-        return cls(values, (0,) * INTERVALS_PER_WEEK)
+        return cls(values, (0,) * INTERVALS_PER_WEEK, IDLE_CONSUMPTION_KWH)
 
     @classmethod
     def from_samples(
         cls, samples: Iterable[tuple[datetime, float]]
     ) -> WeeklyConsumptionProfile:
-        """Average measured quarter-hour energy into the 672 weekly slots.
+        """Learn working-hour slots and one idle average from completed quarters.
 
         Each sample is one completed quarter hour, keyed by its local start.
-        Slots the history does not cover keep their weekday default, which is
-        left untrimmed because a guess is not a measurement.
+        Only idle samples outside 08:00-18:00 contribute to the shared idle
+        average, so daytime solar dips cannot lower it. Every idle slot uses
+        that average, including daytime weekends and slots with no history.
+        Uncovered working slots and an unlearned idle average keep defaults.
         """
         totals = [0.0] * INTERVALS_PER_WEEK
         counts = [0] * INTERVALS_PER_WEEK
+        idle_total = 0.0
+        idle_count = 0
         for timestamp, consumption_kwh in samples:
             index = weekly_slot_index(timestamp)
-            totals[index] += max(0.0, consumption_kwh)
+            consumption_kwh = max(0.0, consumption_kwh)
+            totals[index] += consumption_kwh
             counts[index] += 1
+            if (
+                not _is_working_slot(*divmod(index, INTERVALS_PER_DAY))
+                and not 8 <= timestamp.hour < 18
+            ):
+                idle_total += consumption_kwh
+                idle_count += 1
 
-        defaults = cls.default().values_kwh
+        idle_consumption = idle_total / idle_count if idle_count else IDLE_CONSUMPTION_KWH
         values = tuple(
-            max(0.0, total / count - CONSUMPTION_MARGIN_KWH) if count else default
-            for total, count, default in zip(totals, counts, defaults, strict=True)
+            (total / count if count else ACTIVE_CONSUMPTION_KWH)
+            if _is_working_slot(*divmod(index, INTERVALS_PER_DAY))
+            else idle_consumption
+            for index, (total, count) in enumerate(zip(totals, counts, strict=True))
         )
-        return cls(values, tuple(counts))
+        return cls(values, tuple(counts), idle_consumption, idle_count)
 
     def consumption_kwh(self, timestamp: datetime) -> float:
         """Return typical energy consumption for the timestamp's weekly slot."""
@@ -189,15 +201,20 @@ def default_consumption_kwh(timestamp: datetime) -> float:
 
 def _default_consumption_for_slot(weekday: int, slot: int) -> float:
     """Return the seeded energy consumption for one weekday and slot."""
+    return ACTIVE_CONSUMPTION_KWH if _is_working_slot(weekday, slot) else IDLE_CONSUMPTION_KWH
+
+
+def _is_working_slot(weekday: int, slot: int) -> bool:
+    """Identify working hours consistently for defaults and learned idle load."""
     interval_time = time(
         slot // INTERVALS_PER_HOUR,
         slot % INTERVALS_PER_HOUR * INTERVAL_MINUTES,
     )
     if weekday < 4 and time(7, 45) <= interval_time < time(18, 30):
-        return ACTIVE_CONSUMPTION_KWH
+        return True
     if weekday == 4 and time(7, 45) <= interval_time < time(13, 30):
-        return ACTIVE_CONSUMPTION_KWH
-    return IDLE_CONSUMPTION_KWH
+        return True
+    return False
 
 
 def calculate_price_thresholds(

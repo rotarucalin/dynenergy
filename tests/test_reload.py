@@ -103,9 +103,9 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         self.entities = []
         self.events = []
         self.persisted = {}
-        # One measured quarter hour in slot 1; the margin trims it to 0.123 kWh.
+        # A working-hour sample leaves idle on the default while retaining its load.
         self.history_samples = [
-            (start + timedelta(minutes=15), 0.123 + optimizer.CONSUMPTION_MARGIN_KWH)
+            (start + timedelta(hours=8), 0.123)
         ]
 
         async def executor(job, *args):
@@ -248,9 +248,9 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNot(type(coordinator.data.plan), type(previous.data.plan))
             self.assertEqual(coordinator.data.plan.intervals[0].consumption_kwh, idle_kwh)
             self.assertAlmostEqual(
-                coordinator.data.consumption_profile.values_kwh[1], 0.123
+                coordinator.data.consumption_profile.values_kwh[32], 0.123
             )
-            self.assertEqual(coordinator.data.consumption_profile.sample_counts[1], 1)
+            self.assertEqual(coordinator.data.consumption_profile.sample_counts[32], 1)
             self.assertEqual(self.entities[1].native_value, watts)
             self.assertEqual(self.entities[0].extra_state_attributes["intervals"][0]
                              ["target_battery_power_w"], watts)
@@ -283,6 +283,57 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(optimizer, "INTERVAL_HOURS", 0.5):
             self.assertEqual(self.entities[2].native_value, 120)
             self.assertEqual(self.entities[2].extra_state_attributes["interval_minutes"], 30)
+        await self.unload_entry()
+
+    async def test_idle_average_reaches_graph_and_helper_and_refreshes_nightly(self):
+        start = self.now.replace(minute=0)
+        self.history_samples = [
+            (start - timedelta(days=7), 0.06),
+            (start - timedelta(days=6), 0.10),
+            (start - timedelta(days=3) + timedelta(hours=14), 0.0),
+            (start - timedelta(days=2) + timedelta(hours=12), 0.0),
+            (start - timedelta(days=7) + timedelta(hours=8), 0.123),
+        ]
+        coordinator = await self.setup_entry()
+        typical = self.entities[2]
+        attributes = typical.extra_state_attributes
+        self.assertEqual(typical.native_value, 320)
+        self.assertEqual(attributes["idle_consumption_w"], 320)
+        self.assertEqual(attributes["idle_sample_count"], 2)
+        self.assertEqual(attributes["weekly_profile_w"]["saturday"], [320] * 96)
+        self.assertEqual(attributes["weekly_profile_w"]["friday"][54:], [320] * 42)
+        self.assertEqual(attributes["weekly_profile_w"]["monday"][32], 492)
+        self.assertEqual(attributes["sample_counts"]["saturday"][48], 1)
+        self.assertTrue(all(
+            interval.consumption_kwh == 0.08 for interval in coordinator.data.plan.intervals
+        ))
+        self.hass.services.async_call.assert_awaited_with(
+            "input_number", "set_value",
+            {"entity_id": "input_number.target", "value": 320}, blocking=True,
+        )
+
+        # The nightly callback rebuilds the pooled idle mean before tomorrow's plan.
+        self.history_samples.append((start, 0.14))
+        tomorrow = start + timedelta(days=1)
+        self.states["sensor.price"].attributes["data"] = [{
+            "start_time": (tomorrow + timedelta(minutes=15 * index)).isoformat(),
+            "end_time": (tomorrow + timedelta(minutes=15 * (index + 1))).isoformat(),
+            "price_per_kwh": 0.20,
+        } for index in range(3)]
+        night = start.replace(hour=23, minute=50)
+        coordinator_module.dt_util.now.return_value = night
+        await coordinator._async_create_next_day_plan(night)
+        self.assertIsNone(coordinator.data.planning_error)
+        self.assertEqual(typical.extra_state_attributes["idle_consumption_w"], 400)
+        self.assertEqual(typical.extra_state_attributes["idle_sample_count"], 3)
+        self.assertEqual(typical.extra_state_attributes["weekly_profile_w"]["sunday"], [400] * 96)
+        self.assertEqual(coordinator.data.plan.intervals[0].timestamp, tomorrow)
+        self.assertAlmostEqual(coordinator.data.plan.intervals[0].consumption_kwh, 0.10)
+        await coordinator._async_apply_scheduled_power(tomorrow)
+        self.hass.services.async_call.assert_awaited_with(
+            "input_number", "set_value",
+            {"entity_id": "input_number.target", "value": 400}, blocking=True,
+        )
         await self.unload_entry()
 
     async def test_reloads_while_inputs_are_missing_clean_up_readiness_timers(self):

@@ -116,12 +116,12 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
                 state=value, attributes={"unit_of_measurement": unit}
             )
 
-        # Two Mondays of history for slot 0 average to 0.0275 kWh, which the
-        # 0.0125 kWh margin trims to the 0.015 kWh / 60 W the learned case expects.
+        # Two Mondays of history for slot 0 average to 0.0275 kWh / 110 W,
+        # which reaches the helper without a deduction.
         history = [(start - timedelta(days=7), 0.03), (start, 0.025)]
         for source, samples, sample_count, expected_kwh, expected_watts in [
             ("no_history", [], 0, 0.060, 240),
-            ("history", history, 2, 0.015, 60),
+            ("history", history, 2, 0.0275, 110),
         ]:
             with self.subTest(source=source):
                 hass = SimpleNamespace(
