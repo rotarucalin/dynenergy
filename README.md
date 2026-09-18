@@ -220,7 +220,7 @@ DynEnergy creates these sensors:
 
 | Entity name | Unit | Meaning |
 |---|---|---|
-| Battery plan | EUR | Expected daily EPEX saving from the current day-ahead plan. Its attributes contain the full schedule, plan summary, source readings, and status. |
+| Battery plan | ct | Expected daily EPEX saving from the current day-ahead plan, rounded to whole euro cents with no decimal places. Its attributes contain the full schedule, plan summary (costs and savings in EUR), source readings, and status. |
 | Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
 | Typical consumption | W | Forecast demand for the current weekly slot. Attributes contain all 672 weekly values, observed history counts per slot (`sample_counts`), the shared idle level (`idle_consumption_w`), and the number of eligible quarters behind it (`idle_sample_count`). |
 | Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. Its attributes add the stored energy, the total charged energy, and the lifetime average price paid per charged kWh. |

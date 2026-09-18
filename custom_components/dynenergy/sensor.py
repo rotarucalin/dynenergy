@@ -54,6 +54,8 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
     _attr_has_entity_name = True
     _attr_name = "Battery plan"
     _attr_icon = "mdi:battery-clock-outline"
+    _attr_native_unit_of_measurement = "ct"
+    _attr_suggested_display_precision = 0
     _unrecorded_attributes = frozenset({"intervals", "summary"})
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
@@ -62,10 +64,10 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
         self._attr_unique_id = f"{entry.entry_id}_plan"
 
     @property
-    def native_value(self) -> float | None:
-        """Return expected daily saving once the solver has produced a plan."""
+    def native_value(self) -> int | None:
+        """Return expected daily saving rounded to whole euro cents."""
         plan = self.coordinator.data.plan
-        return plan.summary.daily_saving if plan else None
+        return round(plan.summary.daily_saving * 100) if plan else None
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
