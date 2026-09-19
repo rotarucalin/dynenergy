@@ -30,6 +30,7 @@ actions:
       charge_price_max: 19
       discharge_soc_min: 20
       discharge_price_min: 13
+      solar_grid_deadband: 50
       default_device_max_power: 1500
       power_step: 20
       update_threshold: 25
@@ -128,6 +129,8 @@ actions:
       raw_target: >
         {% set scheduled = scheduled_target | float(0) %} {% set current =
         current_target | float(0) %} {% set grid = grid_power | float(0) %}
+        {% set filtered = filtered_power | float(0) %}
+        {% set deadband = solar_grid_deadband | float(50) %}
 
         {% if not soc_valid %}
 
@@ -169,6 +172,38 @@ actions:
           {% else %}
 
             {{ scheduled }}
+
+          {% endif %}
+
+        {% elif grid_valid
+              and filtered_valid
+              and current < 0
+              and passive_power_acknowledged
+              and soc < solar_soc_max %}
+
+          {#
+            While already charging from solar, keep the current target
+            while filtered grid power is inside the +/- deadband.
+          #}
+
+          {% if filtered >= -deadband
+                and filtered <= deadband %}
+
+            {{ current }}
+
+          {% else %}
+
+            {% set solar_neutral = current + filtered %}
+
+            {% if scheduled < 0 %}
+
+              {{ [scheduled, solar_neutral] | min }}
+
+            {% else %}
+
+              {{ [solar_neutral, 0] | min }}
+
+            {% endif %}
 
           {% endif %}
 
