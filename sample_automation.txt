@@ -1,0 +1,305 @@
+alias: Marstek - Dynamic DynEnergy control
+description: >
+  Run every minute and control the Marstek battery from the DynEnergy
+  recommendation, actual consumption, SOC, market price and solar surplus.
+
+  Solar-surplus charging is only adjusted when the currently requested Marstek
+  passive power has been acknowledged by the battery.
+
+  Discharge power is based on current Marstek power plus current grid import,
+  capped by the DynEnergy recommendation. Excess discharge causing grid export
+  is reduced to the actual load instead of interrupting discharge.
+triggers:
+  - trigger: time_pattern
+    minutes: /1
+    seconds: '0'
+conditions: []
+actions:
+  - variables:
+      dyn_target_entity: input_number.dynenergy_recommended_power
+      filtered_power_entity: sensor.restricted_increase_power
+      soc_entity: sensor.marstek_battery_system_battery_state_of_charge
+      operating_mode_entity: select.marstek_battery_system_operating_mode
+      passive_power_entity: sensor.marstek_battery_system_grid_power
+      passive_power_state_entity: sensor.ug_und_keller_marstek_battery_system_passive_power_state
+      passive_power_ack_state: acknowledged
+      price_entity: sensor.market_price
+      tasmota_grid_entity: sensor.smart_meter_current_power
+      charge_soc_max: 80
+      solar_soc_max: 100
+      charge_price_max: 19
+      discharge_soc_min: 20
+      discharge_price_min: 13
+      default_device_max_power: 1500
+      power_step: 20
+      update_threshold: 25
+      passive_cd_time: 86400
+  - variables:
+      dyn_valid: '{{ has_value(dyn_target_entity) }}'
+      filtered_valid: '{{ has_value(filtered_power_entity) }}'
+      soc_valid: '{{ has_value(soc_entity) }}'
+      price_valid: '{{ has_value(price_entity) }}'
+      grid_valid: '{{ has_value(tasmota_grid_entity) }}'
+      current_power_valid: '{{ has_value(passive_power_entity) }}'
+      dyn_target: '{{ states(dyn_target_entity) | float(0) }}'
+      filtered_power: '{{ states(filtered_power_entity) | float(0) }}'
+      soc: '{{ states(soc_entity) | float(0) }}'
+      price: '{{ states(price_entity) | float(0) }}'
+      grid_power: '{{ states(tasmota_grid_entity) | float(0) }}'
+      passive_power_state: |
+        {{ states(passive_power_state_entity) | lower }}
+      passive_power_acknowledged: |
+        {{
+          states(passive_power_state_entity) | lower
+          ==
+          passive_power_ack_state | lower
+        }}
+      current_target: |
+        {% if has_value(passive_power_entity) %}
+          {{ states(passive_power_entity) | float(0) }}
+        {% else %}
+          0
+        {% endif %}
+      device_max_power: |
+        {{
+          state_attr(passive_power_entity, 'max')
+          | float(default_device_max_power)
+        }}
+  - variables:
+      scheduled_target: |
+        {% if not soc_valid
+              or not dyn_valid
+              or not price_valid %}
+
+          0
+
+        {% elif dyn_target < 0
+              and soc < charge_soc_max
+              and price <= charge_price_max %}
+
+          {{ dyn_target }}
+
+        {% elif dyn_target > 0
+              and soc > discharge_soc_min
+              and price >= discharge_price_min
+              and grid_valid
+              and current_power_valid %}
+
+          {#
+            Actual consumption behind the meter is:
+
+              current battery discharge + remaining grid import
+
+            Examples:
+
+              current = 100 W
+              grid    = 150 W
+              load    = 250 W
+
+              current = 240 W
+              grid    = -60 W
+              load    = 180 W
+
+            Never discharge above either actual load or the
+            DynEnergy recommendation.
+          #}
+
+          {% set actual_load =
+            [
+              (current_target | float(0))
+              + (grid_power | float(0)),
+              0
+            ] | max
+          %}
+
+          {{
+            [
+              actual_load,
+              dyn_target | float(0)
+            ] | min
+          }}
+
+        {% else %}
+
+          0
+
+        {% endif %}
+  - variables:
+      raw_target: >
+        {% set scheduled = scheduled_target | float(0) %} {% set current =
+        current_target | float(0) %} {% set grid = grid_power | float(0) %}
+
+        {% if not soc_valid %}
+
+          0
+
+        {% elif grid_valid
+              and current > 0
+              and passive_power_acknowledged %}
+
+          {#
+            We are currently discharging and the command is acknowledged.
+
+            current + grid is the actual load.
+
+            If excessive discharge causes export, reduce the discharge
+            instead of interpreting that export as solar surplus.
+
+            Example:
+
+              current = 240 W
+              grid    = -60 W
+
+              actual_load = 180 W
+
+            Therefore the new discharge target becomes at most 180 W.
+          #}
+
+          {% set actual_load =
+            [
+              current + grid,
+              0
+            ] | max
+          %}
+
+          {% if scheduled > 0 %}
+
+            {{ [scheduled, actual_load] | min }}
+
+          {% else %}
+
+            {{ scheduled }}
+
+          {% endif %}
+
+        {% elif grid_valid
+              and grid < 0
+              and passive_power_acknowledged %}
+
+          {#
+            We are not currently discharging.
+
+            Therefore negative grid power can be treated as genuine
+            surplus available for charging.
+          #}
+
+          {% set solar_neutral = current + grid %}
+
+          {% if solar_neutral < 0 %}
+
+            {% if soc < solar_soc_max %}
+
+              {% if scheduled < 0 %}
+
+                {#
+                  DynEnergy already wants charging.
+                  Keep scheduled charging but absorb additional surplus
+                  when necessary.
+                #}
+
+                {{ [scheduled, solar_neutral] | min }}
+
+              {% else %}
+
+                {#
+                  No scheduled charging.
+                  Charge using available solar surplus.
+                #}
+
+                {{ solar_neutral }}
+
+              {% endif %}
+
+            {% else %}
+
+              0
+
+            {% endif %}
+
+          {% elif scheduled > 0 %}
+
+            {{ [scheduled, solar_neutral] | min }}
+
+          {% else %}
+
+            {{ scheduled }}
+
+          {% endif %}
+
+        {% else %}
+
+          {#
+            No export correction, or the current passive power command
+            has not yet been acknowledged.
+          #}
+
+          {{ scheduled }}
+
+        {% endif %}
+  - variables:
+      bounded_target: |
+        {% set p = raw_target | float(0) %} {% set limit =
+          device_max_power | float(default_device_max_power)
+        %}
+        {% if p > limit %}
+          {{ limit }}
+        {% elif p < -limit %}
+          {{ -limit }}
+        {% else %}
+          {{ p }}
+        {% endif %}
+  - variables:
+      desired_power: |
+        {{
+          (
+            (
+              (bounded_target | float(0))
+              / (power_step | float(20))
+            )
+            | round(0)
+            * (power_step | float(20))
+          )
+          | int
+        }}
+  - variables:
+      should_update: |
+        {% set mode = states(operating_mode_entity) | lower %}
+        {#
+          Do not cancel a pending charging command with 0.
+          Wait until the negative power has been acknowledged first.
+        #}
+        {% if not passive_power_acknowledged
+              and (current_target | float(0)) < 0
+              and (desired_power | int) == 0 %}
+
+          false
+
+        {% elif mode != 'passive' %}
+
+          true
+
+        {% elif not current_power_valid %}
+
+          true
+
+        {% else %}
+
+          {{
+            (
+              (desired_power | int)
+              -
+              (current_target | float(0))
+            ) | abs
+            >
+            (update_threshold | float(25))
+          }}
+
+        {% endif %}
+  - condition: template
+    value_template: '{{ should_update }}'
+  - action: marstek.set_operating_mode_passive
+    data:
+      entity_id: '{{ operating_mode_entity }}'
+      power: '{{ desired_power | int }}'
+      cd_time: '{{ passive_cd_time | int }}'
+mode: single
