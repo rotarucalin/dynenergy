@@ -112,30 +112,24 @@ actions:
               0
             ] | max
           %}
-
           {{
             [
               actual_load,
               dyn_target | float(0)
             ] | min
           }}
-
         {% else %}
-
           0
-
         {% endif %}
   - variables:
       raw_target: >
         {% set scheduled = scheduled_target | float(0) %} {% set current =
-        current_target | float(0) %} {% set grid = grid_power | float(0) %}
-        {% set filtered = filtered_power | float(0) %}
-        {% set deadband = solar_grid_deadband | float(50) %}
+        current_target | float(0) %} {% set grid = grid_power | float(0) %} {%
+        set filtered = filtered_power | float(0) %} {% set deadband =
+        solar_grid_deadband | float(50) %}
 
         {% if not soc_valid %}
-
           0
-
         {% elif grid_valid
               and current > 0
               and passive_power_acknowledged %}
@@ -145,131 +139,77 @@ actions:
 
             current + grid is the actual load.
 
-            If excessive discharge causes export, reduce the discharge
-            instead of interpreting that export as solar surplus.
+            If excessive discharge causes export, reduce the discharge instead of interpreting that export as solar surplus.
 
-            Example:
-
-              current = 240 W
-              grid    = -60 W
-
-              actual_load = 180 W
+            Example: current = 240 W, grid = -60 W => actual_load = 180 W
 
             Therefore the new discharge target becomes at most 180 W.
           #}
-
           {% set actual_load =
             [
               current + grid,
               0
             ] | max
           %}
-
           {% if scheduled > 0 %}
-
             {{ [scheduled, actual_load] | min }}
-
           {% else %}
-
             {{ scheduled }}
-
           {% endif %}
-
         {% elif grid_valid
               and filtered_valid
               and current < 0
               and passive_power_acknowledged
               and soc < solar_soc_max %}
-
-          {#
-            While already charging from solar, keep the current target
-            while filtered grid power is inside the +/- deadband.
-          #}
-
-          {% if filtered >= -deadband
+          {# While already charging from solar, keep the current target while filtered grid power is inside the +/- deadband. #}
+          {% if filtered > ((current | abs) + deadband) %}
+            0
+          {% elif filtered >= -deadband
                 and filtered <= deadband %}
-
             {{ current }}
-
           {% else %}
-
             {% set solar_neutral = current + filtered %}
-
             {% if scheduled < 0 %}
-
               {{ [scheduled, solar_neutral] | min }}
-
             {% else %}
-
               {{ [solar_neutral, 0] | min }}
-
             {% endif %}
-
           {% endif %}
-
         {% elif grid_valid
               and grid < 0
               and passive_power_acknowledged %}
-
-          {#
-            We are not currently discharging.
-
-            Therefore negative grid power can be treated as genuine
-            surplus available for charging.
-          #}
-
+          {# We are not currently discharging. Therefore negative grid power can be treated as genuine surplus available for charging. #}
           {% set solar_neutral = current + grid %}
-
           {% if solar_neutral < 0 %}
-
             {% if soc < solar_soc_max %}
-
               {% if scheduled < 0 %}
-
                 {#
                   DynEnergy already wants charging.
                   Keep scheduled charging but absorb additional surplus
                   when necessary.
                 #}
-
                 {{ [scheduled, solar_neutral] | min }}
-
               {% else %}
-
                 {#
                   No scheduled charging.
                   Charge using available solar surplus.
                 #}
-
                 {{ solar_neutral }}
-
               {% endif %}
-
             {% else %}
-
               0
-
             {% endif %}
-
           {% elif scheduled > 0 %}
-
             {{ [scheduled, solar_neutral] | min }}
-
           {% else %}
-
             {{ scheduled }}
-
           {% endif %}
-
         {% else %}
-
           {#
             No export correction, or the current passive power command
             has not yet been acknowledged.
           #}
-
           {{ scheduled }}
-
         {% endif %}
   - variables:
       bounded_target: |
@@ -306,19 +246,16 @@ actions:
         {% if not passive_power_acknowledged
               and (current_target | float(0)) < 0
               and (desired_power | int) == 0 %}
-
           false
-
+        {% elif passive_power_acknowledged
+              and (current_target | float(0)) < 0
+              and (desired_power | int) == 0 %}
+          true        
         {% elif mode != 'passive' %}
-
           true
-
         {% elif not current_power_valid %}
-
           true
-
         {% else %}
-
           {{
             (
               (desired_power | int)
@@ -328,7 +265,6 @@ actions:
             >
             (update_threshold | float(25))
           }}
-
         {% endif %}
   - condition: template
     value_template: '{{ should_update }}'
