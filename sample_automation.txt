@@ -42,6 +42,8 @@ actions:
       price_valid: '{{ has_value(price_entity) }}'
       grid_valid: '{{ has_value(tasmota_grid_entity) }}'
       current_power_valid: '{{ has_value(passive_power_entity) }}'
+      mode_valid: '{{ has_value(operating_mode_entity) }}'
+      passive_power_state_valid: '{{ has_value(passive_power_state_entity) }}'
       dyn_target: '{{ states(dyn_target_entity) | float(0) }}'
       filtered_power: '{{ states(filtered_power_entity) | float(0) }}'
       soc: '{{ states(soc_entity) | float(0) }}'
@@ -59,7 +61,7 @@ actions:
         {% if has_value(passive_power_entity) %}
           {{ states(passive_power_entity) | float(0) }}
         {% else %}
-          0
+          {{ none }}
         {% endif %}
       device_max_power: |
         {{
@@ -67,14 +69,21 @@ actions:
           | float(default_device_max_power)
         }}
   - variables:
+      control_state_valid: |
+        {{
+          dyn_valid
+          and soc_valid
+          and price_valid
+          and grid_valid
+          and current_power_valid
+          and mode_valid
+          and passive_power_state_valid
+        }}
+  - condition: template
+    value_template: '{{ control_state_valid }}'
+  - variables:
       scheduled_target: |
-        {% if not soc_valid
-              or not dyn_valid
-              or not price_valid %}
-
-          0
-
-        {% elif dyn_target < 0
+        {% if dyn_target < 0
               and soc < charge_soc_max
               and price <= charge_price_max %}
 
@@ -162,16 +171,22 @@ actions:
               and passive_power_acknowledged
               and soc < solar_soc_max %}
           {# While already charging from solar, keep the current target while filtered grid power is inside the +/- deadband. #}
-          {% if filtered > ((current | abs) + deadband) %}
-            0
-          {% elif filtered >= -deadband
-                and filtered <= deadband %}
-            {{ current }}
-          {% else %}
-            {% set solar_neutral = current + filtered %}
-            {% if scheduled < 0 %}
-              {{ [scheduled, solar_neutral] | min }}
+          {% if scheduled < 0 %}
+            {% if filtered >= -deadband
+                  and filtered <= deadband %}
+              {{ current }}
             {% else %}
+              {% set solar_neutral = current + filtered %}
+              {{ [scheduled, solar_neutral] | min }}
+            {% endif %}
+          {% else %}
+            {% if filtered > ((current | abs) + deadband) %}
+              0
+            {% elif filtered >= -deadband
+                  and filtered <= deadband %}
+              {{ current }}
+            {% else %}
+              {% set solar_neutral = current + filtered %}
               {{ [solar_neutral, 0] | min }}
             {% endif %}
           {% endif %}
@@ -243,17 +258,21 @@ actions:
           Do not cancel a pending charging command with 0.
           Wait until the negative power has been acknowledged first.
         #}
-        {% if not passive_power_acknowledged
+        {% if not mode_valid %}
+          false
+        {% elif not current_power_valid %}
+          false
+        {% elif not passive_power_state_valid %}
+          false
+        {% elif not passive_power_acknowledged
               and (current_target | float(0)) < 0
               and (desired_power | int) == 0 %}
           false
         {% elif passive_power_acknowledged
               and (current_target | float(0)) < 0
               and (desired_power | int) == 0 %}
-          true        
+          {{ soc_valid }}
         {% elif mode != 'passive' %}
-          true
-        {% elif not current_power_valid %}
           true
         {% else %}
           {{
@@ -273,4 +292,9 @@ actions:
       entity_id: '{{ operating_mode_entity }}'
       power: '{{ desired_power | int }}'
       cd_time: '{{ passive_cd_time | int }}'
+  - action: input_number.set_value
+    target:
+      entity_id: input_number.marstek_commanded_power
+    data:
+      value: '{{ desired_power | int }}'
 mode: single
