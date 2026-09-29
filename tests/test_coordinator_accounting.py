@@ -64,7 +64,8 @@ def _load_coordinator():
         "homeassistant.core": {"HomeAssistant": object},
         "homeassistant.exceptions": {"HomeAssistantError": RuntimeError},
         "homeassistant.helpers.event": {"async_track_time_change": Mock()},
-        "homeassistant.helpers.storage": {"Store": Mock()},
+        "homeassistant.helpers.storage": {"Store": lambda *args: SimpleNamespace(
+            async_load=AsyncMock(return_value=None), async_save=AsyncMock())},
         "homeassistant.helpers.update_coordinator": {
             "DataUpdateCoordinator": CoordinatorBase
         },
@@ -686,7 +687,7 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(coordinator._consumption_profile, refreshed)
             calls.append("plan")
 
-        coordinator._async_refresh_plan = AsyncMock(side_effect=create_plan)
+        coordinator._async_compare = AsyncMock(side_effect=create_plan)
         coordinator._async_refresh_consumption_profile = AsyncMock(
             side_effect=refresh_profile
         )
@@ -694,8 +695,8 @@ class QuarterHourAccountingTests(unittest.IsolatedAsyncioTestCase):
         await coordinator._async_create_next_day_plan(self.start)
 
         self.assertEqual(calls, ["profile", "plan"])
-        target_date, = coordinator._async_refresh_plan.await_args.args
-        self.assertEqual(target_date, self.start.date() + timedelta(days=1))
+        comparison_time, = coordinator._async_compare.await_args.args
+        self.assertEqual(comparison_time, self.start)
 
     async def test_shutdown_during_profile_refresh_skips_nightly_planning(self):
         """A teardown during the history read must not start a new plan."""

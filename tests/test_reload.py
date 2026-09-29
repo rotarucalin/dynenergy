@@ -327,6 +327,11 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(typical.extra_state_attributes["idle_consumption_w"], 400)
         self.assertEqual(typical.extra_state_attributes["idle_sample_count"], 3)
         self.assertEqual(typical.extra_state_attributes["weekly_profile_w"]["sunday"], [400] * 96)
+        # The 23:50 callback refreshes learning but preserves the active plan.
+        # Partial tomorrow prices never replace it; midnight makes a current plan.
+        self.assertEqual(coordinator.data.plan.intervals[0].timestamp, start)
+        coordinator_module.dt_util.now.return_value = tomorrow
+        await coordinator._async_run_interval_tasks(tomorrow)
         self.assertEqual(coordinator.data.plan.intervals[0].timestamp, tomorrow)
         self.assertAlmostEqual(coordinator.data.plan.intervals[0].consumption_kwh, 0.10)
         await coordinator._async_apply_scheduled_power(tomorrow)

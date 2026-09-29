@@ -19,6 +19,8 @@ from .const import (
     CONF_CHARGE_PRICE_THRESHOLD,
     CONF_CONSUMED_ENERGY_ENTITY,
     CONF_DEGRADATION_COST,
+    CONF_CYCLE_COST,
+    CONF_CYCLE_DEBUG,
     CONF_DISCHARGE_EFFICIENCY,
     CONF_MAX_CHARGE_POWER_ENTITY,
     CONF_MAX_DISCHARGE_POWER_ENTITY,
@@ -87,6 +89,12 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_DISCHARGE_EFFICIENCY,
                 default=defaults.get(CONF_DISCHARGE_EFFICIENCY, 0.95),
             ): vol.All(vol.Coerce(float), vol.Range(min=0.01, max=1)),
+            vol.Optional(
+                CONF_CYCLE_COST, default=defaults.get(CONF_CYCLE_COST, 0.06)
+            ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional(
+                CONF_CYCLE_DEBUG, default=defaults.get(CONF_CYCLE_DEBUG, False)
+            ): bool,
             vol.Optional(
                 CONF_DEGRADATION_COST, default=defaults.get(CONF_DEGRADATION_COST, 0.0)
             ): vol.All(vol.Coerce(float), vol.Range(min=0)),

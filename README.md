@@ -10,8 +10,10 @@ realized EPEX savings when that energy is discharged.
 
 ## Features
 
-- Creates the next day's battery plan at 23:50 local time from EPEX day-ahead
-  prices.
+- Compares today's remaining greedy plan with tomorrow's at 15:30 local time,
+  once complete tomorrow prices are available; retries each quarter hour.
+- Selectively removes energy-matched discharge/recharge pairs using a configurable
+  6 ct/kWh extra-cycle allowance, while preserving later forecast demand.
 - Updates a signed battery-power target every 15 minutes: negative Watts charge,
   positive Watts discharge, and zero is idle.
 - Uses configurable battery capacity, power limits, SOC limits, and round-trip
@@ -26,7 +28,8 @@ realized EPEX savings when that energy is discharged.
   recorder history for the consumption and battery energy meters, subtracting
   charging and adding discharging, and exposes it through the Typical consumption
   sensor.
-- Persists accounting data and meter baselines across Home Assistant restarts.
+- Persists accounting data separately from dated baseline and adjusted schedules,
+  including the match ledger, across Home Assistant restarts.
 
 ## Requirements
 
@@ -78,8 +81,11 @@ realized EPEX savings when that energy is discharged.
 Startup planning waits for SoC, battery capacity, charge/discharge power limits,
 and the requested day's EPEX prices. While sources are unavailable, DynEnergy
 checks every five seconds without blocking integration setup. Once they are
-ready, it generates the plan and applies the current interval's target. Daily
-planning continues at 23:50 local time.
+ready, it restores a valid dated schedule or generates today's remaining plan,
+then applies the current interval's target. Cross-day comparison starts at 15:30
+and retries on subsequent quarter-hour boundaries. The legacy 23:50 callback
+refreshes consumption history and preserves the adjusted schedule; comparisons
+started between boundaries wait for the next quarter.
 
 Existing DynEnergy installations must use **Reconfigure** after upgrading to
 select the cumulative battery charged and discharged energy sensors.
@@ -101,11 +107,46 @@ select the cumulative battery charged and discharged energy sensors.
 | Charge price threshold | EUR/kWh | Ceiling on the daily charge threshold; defaults to `0.10`. |
 | Minimum / maximum SOC | Percent | Must be ordered and within 0-100. |
 | Charge / discharge efficiency | Decimal | Defaults to `0.95` for each direction. |
-| Battery degradation cost | EUR/kWh | Included in the plan cost estimate. Defaults to `0`. |
+| Battery degradation cost | EUR/kWh | Included in the plan cost estimate. Defaults to `0`; never added to the cycle-cancellation threshold. |
+| Extra cycle allowance | EUR/kWh delivered | `cycle_cost_per_kwh`, default `0.06`. Fixed total economic approximation for extra round-trip losses and wear. |
+| Cycle comparison debug | Boolean | `cycle_cancellation_debug`, default `false`. Bounded candidate and match details, excluded from recorder history. |
 
 The charged and discharged totals must be battery-side energy counters. If they
 reset, DynEnergy treats the decreased value as a new baseline; it does not
 create a false charging or discharging transaction.
+
+## Cross-day cycle cancellation
+
+The existing greedy planner supplies both candidate schedules. At 15:30,
+DynEnergy snapshots today's remainder and projects its end-of-day SOC from
+measured SOC. That projected SOC opens tomorrow's forecast. It cancels matched
+early discharge and replacement charging when:
+
+`early_price <= replacement_price + cycle_cost_per_kwh`
+
+Prices are EUR/kWh. Equality favors fewer cycles. The default `0.06` is a fixed
+economic approximation including losses and wear, not a second degradation or
+efficiency surcharge. Stored acquisition cost remains in measured accounting;
+neither it nor the later discharge price adds a cancellation threshold.
+
+At ideal efficiency, 20/15/40 ct prices cancel the extra cycle: cancelling reduces
+predicted cash flow by 5 ct/kWh but improves the allowance-based estimate by
+1 ct/kWh. At 25/15/40 ct, the extra cycle remains. These two monetary figures are
+published separately. Physical matching always uses the configured efficiencies.
+
+The comparison reserves only forecast-supported later discharge and physically
+absorbable charging. It permits partial reductions, validates chronological SOC
+headroom, and removes surplus charging margin from reduced commands. Both today's
+remainder and tomorrow's plan remain available after publication and restart.
+A measured deviation greater than **5 SOC percentage points** triggers fresh greedy
+planning from current measurements at the next quarter boundary, using cached
+remaining prices where available. Failed planning retains the previous schedule.
+
+Battery plan attributes expose comparison status, timestamp, horizon, revision,
+D1/D2/C2/D3 counts and grid/battery energy totals, cancelled quantities, reserved
+energy, terminal SOC, cash-flow change and policy benefit. Original and effective
+Watt targets accompany each slot; the power sensor and helper use the same target.
+See [algorithm, units, persistence and rounding details](docs/cycle-cancellation.md).
 
 ## How Planning Works
 
@@ -220,7 +261,7 @@ DynEnergy creates these sensors:
 
 | Entity name | Unit | Meaning |
 |---|---|---|
-| Battery plan | ct | Expected daily EPEX saving from the current day-ahead plan, rounded to whole euro cents with no decimal places. Its attributes contain the full schedule, plan summary (costs and savings in EUR), source readings, and status. |
+| Battery plan | ct | Expected EPEX saving over the remaining published horizon (today and, after comparison, tomorrow), rounded to whole euro cents with no decimal places. Its attributes contain the full schedule, plan summary (costs and savings in EUR), source readings, and status. |
 | Battery power recommendation | W | Current signed battery target, with the complete plan in its attributes. |
 | Typical consumption | W | Forecast demand for the current weekly slot. Attributes contain all 672 weekly values, observed history counts per slot (`sample_counts`), the shared idle level (`idle_consumption_w`), and the number of eligible quarters behind it (`idle_sample_count`). |
 | Stored energy cost | ct/kWh | Weighted-average EPEX cost basis of energy currently stored in the battery. Its attributes add the stored energy, the total charged energy, and the lifetime average price paid per charged kWh. |
@@ -319,7 +360,7 @@ disconnected from automatic control first.
 
 | Symptom | Check |
 |---|---|
-| `Battery plan` remains unavailable | Startup waits for numeric SoC, capacity, power limits, and EPEX prices, checking every five seconds. Before 23:50 it needs today's remaining intervals; from 23:50 it needs tomorrow's. Inspect `planning_error` for other failures. |
+| `Battery plan` remains unavailable | Startup waits for numeric SoC, capacity, power limits, and EPEX prices, checking every five seconds. Startup needs today's remaining intervals unless a persisted adjusted schedule can be restored. Cross-day comparison requires complete tomorrow coverage. Inspect `planning_error` for other failures. |
 | Accounting sensors do not update | Confirm both battery energy counters are numeric cumulative kWh totals. Inspect `monitoring_error` on `Battery plan`. |
 | No target is applied | Confirm the writable entity is an `input_number`, has adequate negative and positive limits, and your battery automation reads it. |
 | Unexpected accounting total after a meter reset | A reduced counter value is intentionally used as a new baseline. The next positive increment will be accounted normally. |
@@ -332,8 +373,10 @@ disconnected from automatic control first.
   constant, or the 240 W default when no eligible idle history exists.
 - Discharge only offsets modeled household demand. Export optimization is out of
   scope.
-- The plan is generated once daily and assumes the current SOC is the opening
-  SOC for the next day.
+- Greedy forecasts and cycle cancellation depend on learned demand. Unmodeled
+  solar input or demand can cause SOC drift; measurements trigger replanning.
+- Mid-slot restarts restore current commands; comparison and drift rebuilding
+  wait for the next quarter boundary so measured SOC anchors a complete slot.
 - Cost monitoring uses raw EPEX prices, not all-in retail electricity prices.
 
 ## Development
@@ -344,17 +387,18 @@ load the updated setup, coordinator, and sensor modules. Subsequent edits to
 DynEnergy config entry under **Settings > Devices & services**.
 
 Entry setup reloads only the optimizer module, creates a fresh coordinator,
-rebuilds the consumption profile, restores accounting, and generates a startup
-plan before loading the sensors. If required inputs are still unavailable, the
+rebuilds the consumption profile, restores accounting and the dated adjusted
+schedule (or generates a startup plan) before loading the sensors. If required
+inputs are still unavailable, the
 existing five-second readiness check applies. Unloading retains the safe 0 W target,
 so a reload can briefly interrupt battery operation. Changes outside
 `optimizer.py` still require a Home Assistant restart.
 
-Run the pure domain tests from the repository root:
+Run the full test suite from the repository root (HA lifecycle tests use stand-ins):
 
 ```powershell
-$env:PYTHONPATH = (Get-Location).Path
-pytest tests
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q -p no:cacheprovider
 ```
 
 Home Assistant imports require a Home Assistant development environment; the

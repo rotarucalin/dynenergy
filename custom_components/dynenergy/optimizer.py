@@ -7,7 +7,7 @@ from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, time
 from enum import StrEnum
-from math import floor
+from math import floor, isfinite
 from typing import Sequence
 
 INTERVAL_HOURS = 0.25
@@ -86,6 +86,12 @@ class PlanInterval:
     target_battery_energy_kwh: float
     expected_soc_percent: float
     state: OperatingState
+    # Physical signed grid allocation; charging commands may include a margin.
+    allocated_grid_energy_kwh: float | None = None
+    original_target_power_w: int | None = None
+    command_power_w: int | None = None
+    command_expected_soc_percent: float | None = None
+    command_grid_energy_kwh: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +189,8 @@ def weekly_slot_index(timestamp: datetime) -> int:
 
 def target_power_w(interval: PlanInterval) -> int:
     """Convert signed interval energy to watts at the Home Assistant boundary."""
+    if interval.command_power_w is not None:
+        return interval.command_power_w
     return int(interval.target_battery_energy_kwh / INTERVAL_HOURS * 1000)
 
 
@@ -910,6 +918,9 @@ def _build_intervals(
                     if discharge_energy_kwh > 0
                     else OperatingState.IDLE
                 ),
+                allocated_grid_energy_kwh=(
+                    -absorbed_charge_kwh if commanded_charge_kwh > 0 else discharge_energy_kwh
+                ),
             )
         )
 
@@ -1008,7 +1019,7 @@ def _allocate_discharge(
                 and inputs.consumption_kwh[index] > 0
             )
         ),
-        key=lambda index: (-inputs.prices_per_kwh[index], inputs.timestamps[index]),
+        key=lambda index: (-inputs.prices_per_kwh[index], inputs.timestamps[index].timestamp()),
     )
 
     remaining_energy_kwh = available_energy_kwh
@@ -1065,6 +1076,15 @@ def _validate_charge_inputs(
         raise ValueError("Timestamps, prices, and consumption must be non-empty and aligned")
 
     battery = inputs.battery
+    if not all(isfinite(value) for value in (
+        battery.usable_capacity_kwh, battery.max_charge_power_kw,
+        battery.max_discharge_power_kw, battery.min_soc_percent,
+        battery.max_soc_percent, battery.charge_efficiency,
+        battery.discharge_efficiency, battery.degradation_cost_per_kwh,
+        inputs.current_soc_percent, charge_price_threshold_per_kwh,
+        *inputs.prices_per_kwh, *inputs.consumption_kwh,
+    )):
+        raise ValueError("Optimizer inputs must be finite")
     if (
         battery.usable_capacity_kwh <= 0
         or battery.max_charge_power_kw <= 0

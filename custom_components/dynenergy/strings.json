@@ -26,7 +26,9 @@
           "max_soc_percent": "Maximum state of charge (%)",
           "charge_efficiency": "Charging efficiency",
           "discharge_efficiency": "Discharging efficiency",
-          "degradation_cost": "Battery degradation cost per kWh"
+          "degradation_cost": "Battery degradation cost per kWh",
+          "cycle_cost_per_kwh": "Extra cycle allowance (EUR/kWh delivered; fixed losses and wear approximation)",
+          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)"
         }
       },
       "reconfigure": {
@@ -48,7 +50,9 @@
           "max_soc_percent": "Maximum state of charge (%)",
           "charge_efficiency": "Charging efficiency",
           "discharge_efficiency": "Discharging efficiency",
-          "degradation_cost": "Battery degradation cost per kWh"
+          "degradation_cost": "Battery degradation cost per kWh",
+          "cycle_cost_per_kwh": "Extra cycle allowance (EUR/kWh delivered; fixed losses and wear approximation)",
+          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)"
         }
       }
     }

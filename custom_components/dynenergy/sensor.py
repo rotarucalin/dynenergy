@@ -15,7 +15,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfPower
 
 from . import optimizer
-from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, DOMAIN
+from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, CONF_CYCLE_COST, DOMAIN
 from .coordinator import DynEnergyCoordinator
 
 _WEEKDAYS = (
@@ -56,7 +56,7 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
     _attr_icon = "mdi:battery-clock-outline"
     _attr_native_unit_of_measurement = "ct"
     _attr_suggested_display_precision = 0
-    _unrecorded_attributes = frozenset({"intervals", "summary"})
+    _unrecorded_attributes = frozenset({"intervals", "summary", "comparison_debug"})
 
     def __init__(self, coordinator: DynEnergyCoordinator, entry: ConfigEntry) -> None:
         """Initialize the plan sensor."""
@@ -65,7 +65,7 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
 
     @property
     def native_value(self) -> int | None:
-        """Return expected daily saving rounded to whole euro cents."""
+        """Return expected remaining-horizon saving in whole euro cents."""
         plan = self.coordinator.data.plan
         return round(plan.summary.daily_saving * 100) if plan else None
 
@@ -85,7 +85,7 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             "optimization_status": (
                 "failed"
                 if data.planning_error
-                else "waiting_for_23_50"
+                else "waiting_for_inputs"
                 if data.plan is None
                 else "ready"
             ),
@@ -97,13 +97,22 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
                 CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH
             ),
         }
+        attributes.update({"comparison_status": "waiting_for_15_30",
+                           "comparison_timestamp": None,
+                           "horizon_start": None, "horizon_end": None,
+                           "plan_revision": 0,
+                           "decision_reason": "waiting_for_comparison",
+                           "cycle_cost_per_kwh": self.coordinator.entry.data.get(CONF_CYCLE_COST, 0.06),
+                           **(data.comparison or {})})
+        if data.comparison_debug:
+            attributes["comparison_debug"] = data.comparison_debug
         if data.plan:
             local_now = dt_util.now()
             attributes["summary"] = asdict(data.plan.summary)
             attributes["intervals"] = [
                 _interval_as_dict(interval)
                 for interval in data.plan.intervals
-                if interval.timestamp + timedelta(hours=optimizer.INTERVAL_HOURS) > local_now
+                if interval.timestamp.timestamp() + 900 > local_now.timestamp()
             ]
         return attributes
 
@@ -115,7 +124,13 @@ def _interval_as_dict(interval: optimizer.PlanInterval) -> dict[str, object]:
         "price_per_kwh": interval.price_per_kwh,
         "consumption_kwh": interval.consumption_kwh,
         "target_battery_power_w": optimizer.target_power_w(interval),
+        "effective_target_power_w": optimizer.target_power_w(interval),
+        "original_target_power_w": (interval.original_target_power_w
+                                    if interval.original_target_power_w is not None
+                                    else optimizer.target_power_w(interval)),
+        "allocated_grid_energy_kwh": interval.allocated_grid_energy_kwh,
         "expected_soc_percent": interval.expected_soc_percent,
+        "integer_command_expected_soc_percent": interval.command_expected_soc_percent,
         "state": interval.state.value,
     }
 
@@ -148,9 +163,9 @@ class DynEnergyPowerRecommendationSensor(
             (
                 interval
                 for interval in plan.intervals
-                if interval.timestamp
-                <= local_now
-                < interval.timestamp + timedelta(hours=optimizer.INTERVAL_HOURS)
+                if interval.timestamp.timestamp()
+                <= local_now.timestamp()
+                < interval.timestamp.timestamp() + 900
             ),
             None,
         )
@@ -175,6 +190,8 @@ class DynEnergyPowerRecommendationSensor(
                 current.timestamp.isoformat() if current else None
             ),
             "current_state": current.state.value if current else None,
+            "original_target_power_w": (_interval_as_dict(current)["original_target_power_w"] if current else 0),
+            "effective_target_power_w": optimizer.target_power_w(current) if current else 0,
             "plan_start": plan.intervals[0].timestamp.isoformat(),
             "plan_end": (
                 plan.intervals[-1].timestamp + timedelta(hours=optimizer.INTERVAL_HOURS)
