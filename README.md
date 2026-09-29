@@ -19,7 +19,9 @@ realized EPEX savings when that energy is discharged.
 - Uses configurable battery capacity, power limits, SOC limits, and round-trip
   efficiency.
 - Uses daily dynamic price thresholds capped by the configured charge price and
-  a 13 ct/kWh minimum discharge price.
+  a 13 ct/kWh absolute discharge-price floor.
+- Requires **15 ct/kWh net profit** before discharging, after efficiency losses
+  and configured degradation. Price spikes cannot bypass this requirement.
 - Discharges existing energy before charging and available energy after charging
   to the highest-priced eligible household demand slots.
 - Monitors cumulative battery charged/discharged energy every 15 minutes and
@@ -108,6 +110,7 @@ select the cumulative battery charged and discharged energy sensors.
 | Minimum / maximum SOC | Percent | Must be ordered and within 0-100. |
 | Charge / discharge efficiency | Decimal | Defaults to `0.95` for each direction. |
 | Battery degradation cost | EUR/kWh | Included in the plan cost estimate. Defaults to `0`; never added to the cycle-cancellation threshold. |
+| Minimum discharge net profit | EUR/kWh delivered | `minimum_discharge_profit_per_kwh`, default `0.15`. Required profit after losses and degradation; `0` disables this additional gate. |
 | Extra cycle allowance | EUR/kWh delivered | `cycle_cost_per_kwh`, default `0.06`. Fixed total economic approximation for extra round-trip losses and wear. |
 | Cycle comparison debug | Boolean | `cycle_cancellation_debug`, default `false`. Bounded candidate and match details, excluded from recorder history. |
 
@@ -115,9 +118,39 @@ The charged and discharged totals must be battery-side energy counters. If they
 reset, DynEnergy treats the decreased value as a new baseline; it does not
 create a false charging or discharging transaction.
 
+## Minimum discharge profit
+
+Every greedy discharge candidate must clear the configured net-profit minimum,
+including pre-charge discharge, post-charge discharge and full-power spikes.
+The default is **0.15 EUR per delivered kWh**. At ideal efficiency with no
+configured degradation, buying at 10 ct and discharging at 16 ct is rejected;
+25 ct reaches the minimum, subject to the other planning constraints.
+
+For a newly purchased quantity the price must cover:
+
+`purchase_price / (charge_efficiency * discharge_efficiency) + degradation + 0.15`
+
+For mixed stored energy the planner uses the weighted acquisition cost of the
+remaining battery energy, converted to delivered kWh. When a refill block follows,
+the discharge must also earn the minimum over that block's estimated replacement
+cost. The historical meter-account basis is converted for charging losses once
+when entering the forecast; measured accounting totals remain unchanged. Forecast
+purchases and their cost carry across midnight, so tomorrow cannot use today's
+stale cost basis after planned overnight charging.
+
+The **6 ct cycle allowance remains a separate cancellation policy**. It is not
+the minimum profit required to authorize discharge. New profit diagnostics show
+the minimum discharge price and estimated net profit per delivered kWh for each
+planned discharge. The planner may still charge toward its SOC target and hold
+energy when no discharge reaches the required margin.
+
+After upgrading, restart Home Assistant. Previously persisted plans created
+without this profit gate are discarded and rebuilt; they are not executed under
+the new policy. Reconfigure the integration to change the default minimum.
+
 ## Cross-day cycle cancellation
 
-The existing greedy planner supplies both candidate schedules. At 15:30,
+The existing greedy planner, including the net-profit gate above, supplies both candidate schedules. At 15:30,
 DynEnergy snapshots today's remainder and projects its end-of-day SOC from
 measured SOC. That projected SOC opens tomorrow's forecast. It cancels matched
 early discharge and replacement charging when:
@@ -199,7 +232,8 @@ absorbed and delivered interval energy with the configured efficiencies.
 Discharge is normally limited to the forecast demand of the interval. When a
 price climbs more than 30 ct/kWh above the cost basis of the stored energy, the
 interval is treated as a spike: it qualifies on its own, without also clearing
-the discharge threshold, and is planned at full discharge power. The battery
+the daily price-band threshold, and is planned at full discharge power only when
+it also passes the minimum net-profit requirement. The battery
 automation scales the request down to whatever the house is really drawing, so
 the plan reports the part booked above the forecast separately as
 `spike_discharge_kwh`. The cost basis is the average price the plan pays in the

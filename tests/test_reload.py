@@ -83,6 +83,7 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
         }
         config = {
             "price_entity": "sensor.price",
+            "minimum_discharge_profit_per_kwh": 0.0,
             "min_soc_percent": 10, "max_soc_percent": 100,
             "charge_efficiency": 1.0, "discharge_efficiency": 1.0,
             "charge_power_target_entity": "input_number.target",

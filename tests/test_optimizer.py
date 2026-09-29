@@ -273,6 +273,7 @@ def _battery(**overrides: float) -> BatteryParameters:
             "max_soc_percent": MAX_SOC_PERCENT,
             "charge_efficiency": 1.0,
             "discharge_efficiency": 1.0,
+            "minimum_discharge_profit_per_kwh": 0.0,
             **overrides,
         }
     )

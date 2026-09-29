@@ -28,7 +28,8 @@
           "discharge_efficiency": "Discharging efficiency",
           "degradation_cost": "Battery degradation cost per kWh",
           "cycle_cost_per_kwh": "Extra cycle allowance (EUR/kWh delivered; fixed losses and wear approximation)",
-          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)"
+          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)",
+          "minimum_discharge_profit_per_kwh": "Minimum discharge net profit (EUR/kWh delivered, after losses and degradation; 0 disables)"
         }
       },
       "reconfigure": {
@@ -52,7 +53,8 @@
           "discharge_efficiency": "Discharging efficiency",
           "degradation_cost": "Battery degradation cost per kWh",
           "cycle_cost_per_kwh": "Extra cycle allowance (EUR/kWh delivered; fixed losses and wear approximation)",
-          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)"
+          "cycle_cancellation_debug": "Expose detailed cycle comparison diagnostics (excluded from recorder)",
+          "minimum_discharge_profit_per_kwh": "Minimum discharge net profit (EUR/kWh delivered, after losses and degradation; 0 disables)"
         }
       }
     }

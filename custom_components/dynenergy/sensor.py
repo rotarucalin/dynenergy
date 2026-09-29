@@ -15,7 +15,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfPower
 
 from . import optimizer
-from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, CONF_CYCLE_COST, DOMAIN
+from .const import CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH, CONF_CYCLE_COST, CONF_MIN_DISCHARGE_PROFIT, DOMAIN
 from .coordinator import DynEnergyCoordinator
 
 _WEEKDAYS = (
@@ -91,6 +91,9 @@ class DynEnergyPlanSensor(CoordinatorEntity[DynEnergyCoordinator], SensorEntity)
             ),
             "planning_error": data.planning_error,
             "monitoring_error": data.monitoring_error,
+            "minimum_discharge_profit_per_kwh": self.coordinator.entry.data.get(
+                CONF_MIN_DISCHARGE_PROFIT, optimizer.DEFAULT_MIN_DISCHARGE_PROFIT_PER_KWH
+            ),
             "stored_energy_kwh": data.account.stored_energy_kwh,
             "stored_energy_cost_eur": data.account.stored_energy_cost_eur,
             "charge_price_threshold_per_kwh": self.coordinator.entry.data.get(
@@ -122,6 +125,8 @@ def _interval_as_dict(interval: optimizer.PlanInterval) -> dict[str, object]:
     return {
         "timestamp": interval.timestamp.isoformat(),
         "price_per_kwh": interval.price_per_kwh,
+        "minimum_discharge_price_per_kwh": interval.minimum_discharge_price_per_kwh,
+        "expected_discharge_profit_per_kwh": interval.expected_discharge_profit_per_kwh,
         "consumption_kwh": interval.consumption_kwh,
         "target_battery_power_w": optimizer.target_power_w(interval),
         "effective_target_power_w": optimizer.target_power_w(interval),

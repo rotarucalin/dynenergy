@@ -15,6 +15,7 @@ from .const import (
 
 LOGGER = logging.getLogger(__name__)
 SOC_DRIFT_PERCENTAGE_POINTS = 5.0
+PLAN_POLICY_VERSION = 2
 
 
 class CrossDayPlanning:
@@ -76,11 +77,12 @@ class CrossDayPlanning:
         except (KeyError, TypeError, ValueError) as err:
             self._publish_error(self.data.plan, err)
 
-    def _greedy_from_slots(self, slots, battery, soc, account):
+    def _greedy_from_slots(self, slots, battery, soc, account, *, opening_cost=None):
         inputs = optimizer.OptimizerInputs(
             [i.timestamp for i in slots], [i.price_per_kwh for i in slots],
             [self._consumption_profile.consumption_kwh(i.timestamp) for i in slots],
-            soc, battery, account.stored_energy_cost_per_kwh if account.initialized else None,
+            soc, battery, opening_cost if opening_cost is not None else
+            account.stored_energy_cost_per_kwh / battery.charge_efficiency if account.initialized else None,
         )
         return optimizer.create_greedy_charge_plan(inputs, float(self.entry.data.get(
             CONF_CHARGE_PRICE_THRESHOLD, CHARGE_PRICE_THRESHOLD_PER_KWH)))
@@ -130,9 +132,21 @@ class CrossDayPlanning:
                     if [i.timestamp.timestamp() for i in today.intervals] != expected:
                         raise ValueError("Today's remaining baseline coverage is incomplete")
                 projected_soc = today.intervals[-1].expected_soc_percent
+                projected_cost = optimizer.projected_stored_energy_cost_per_kwh(
+                    today.intervals, battery, data.current_soc_percent,
+                    data.account.stored_energy_cost_per_kwh / battery.charge_efficiency
+                    if data.account.initialized else None,
+                )
+                # The measured account uses meter kWh at raw prices. Its basis
+                # needs one charging-loss conversion; this projected basis has
+                # already had that conversion. Keep the account itself untouched.
+                forecast_data = replace(data, current_soc_percent=projected_soc,
+                                        forecast_opening_cost_per_battery_kwh=projected_cost)
                 future = [i for i in self._baseline.intervals if i.timestamp.date() == tomorrow] if self._baseline else []
                 if rebuild and future:
-                    next_day = self._greedy_from_slots(future, battery, projected_soc, data.account)
+                    next_day = self._greedy_from_slots(
+                        future, battery, projected_soc, data.account, opening_cost=projected_cost
+                    )
                 elif rebuild and (local.hour, local.minute) < (15, 30):
                     next_day = None
                 else:
@@ -143,22 +157,30 @@ class CrossDayPlanning:
                     if self._shutting_down:
                         return
                     self._target_day_prices(tomorrow, require_complete=True)
-                    next_day = self._create_charge_plan(replace(data, current_soc_percent=projected_soc), tomorrow)
+                    next_day = self._create_charge_plan(forecast_data, tomorrow)
                 horizon = list(today.intervals) + (list(next_day.intervals) if next_day else [])
                 result = cycles.cancel_cycles(
                     horizon, battery, data.current_soc_percent, tomorrow,
                     float(self.entry.data.get(CONF_CYCLE_COST, cycles.DEFAULT_CYCLE_COST)),
                     debug=bool(self.entry.data.get(CONF_CYCLE_DEBUG, False)),
                 )
+                effective_slots, _ = optimizer.forecast_discharge_economics(
+                    result.adjusted.intervals, battery, data.current_soc_percent,
+                    data.account.stored_energy_cost_per_kwh / battery.charge_efficiency
+                    if data.account.initialized else None,
+                )
+                result = replace(result, adjusted=replace(result.adjusted, intervals=tuple(effective_slots)))
                 revision = self._revision + 1
                 diagnostics = {**result.diagnostics, 'comparison_timestamp': now.isoformat(),
                                'horizon_start': horizon[0].timestamp.isoformat(),
                                'horizon_end': (horizon[-1].timestamp.astimezone(UTC) + timedelta(minutes=15)).isoformat(),
                                'plan_revision': revision,
                                'soc_drift_tolerance_percentage_points': SOC_DRIFT_PERCENTAGE_POINTS,
+                               'minimum_discharge_profit_per_kwh': battery.minimum_discharge_profit_per_kwh,
+                               'projected_tomorrow_stored_cost_per_battery_kwh': projected_cost,
                                'rebuild_reason': 'soc_drift' if rebuild else 'daily_comparison'}
                 compared_date = tomorrow if next_day else local.date()
-                payload = {'version': 1, 'battery': asdict(battery), 'opening_soc': data.current_soc_percent,
+                payload = {'version': PLAN_POLICY_VERSION, 'battery': asdict(battery), 'opening_soc': data.current_soc_percent,
                            'baseline': cycles.serialize_plan(result.baseline),
                            'adjusted': cycles.serialize_plan(result.adjusted),
                            'comparison': diagnostics, 'debug': result.debug,
@@ -185,7 +207,7 @@ class CrossDayPlanning:
         """Restore a dated revision without yesterday's source prices."""
         try:
             saved = await self._plan_store.async_load()
-            if not saved or saved.get('version') != 1:
+            if not saved or saved.get('version') != PLAN_POLICY_VERSION:
                 return False
             battery = optimizer.BatteryParameters(**saved['battery'])
             baseline = cycles.deserialize_plan(saved['baseline'], battery)

@@ -41,6 +41,7 @@ from .const import (
     CONF_MAX_DISCHARGE_POWER_ENTITY,
     CONF_MAX_SOC_PERCENT,
     CONF_MIN_SOC_PERCENT,
+    CONF_MIN_DISCHARGE_PROFIT,
     CONF_PRICE_ENTITY,
     CONF_SOC_ENTITY,
     CHARGE_PRICE_THRESHOLD_PER_KWH,
@@ -86,6 +87,8 @@ class DynEnergyData:
     monitoring_error: str | None = None
     comparison: dict | None = None
     comparison_debug: dict | None = None
+    # Forecast-only override, already including charging losses (EUR/battery kWh).
+    forecast_opening_cost_per_battery_kwh: float | None = None
 
 
 class DynEnergyCoordinator(CrossDayPlanning, DataUpdateCoordinator[DynEnergyData]):
@@ -536,7 +539,9 @@ class DynEnergyCoordinator(CrossDayPlanning, DataUpdateCoordinator[DynEnergyData
             current_soc_percent=data.current_soc_percent,
             battery=battery,
             stored_energy_cost_per_kwh=(
-                data.account.stored_energy_cost_per_kwh
+                data.forecast_opening_cost_per_battery_kwh
+                if data.forecast_opening_cost_per_battery_kwh is not None
+                else data.account.stored_energy_cost_per_kwh / battery.charge_efficiency
                 if data.account.initialized
                 else None
             ),
@@ -559,6 +564,9 @@ class DynEnergyCoordinator(CrossDayPlanning, DataUpdateCoordinator[DynEnergyData
             degradation_cost_per_kwh=float(
                 self.entry.data.get(CONF_DEGRADATION_COST, 0.0)
             ),
+            minimum_discharge_profit_per_kwh=float(self.entry.data.get(
+                CONF_MIN_DISCHARGE_PROFIT, optimizer.DEFAULT_MIN_DISCHARGE_PROFIT_PER_KWH
+            )),
         )
 
     def _target_day_prices(

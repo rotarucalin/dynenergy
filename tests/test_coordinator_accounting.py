@@ -98,6 +98,7 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
         }
         config = {
             "price_entity": "sensor.price",
+            "minimum_discharge_profit_per_kwh": 0.0,
             "min_soc_percent": 10,
             "max_soc_percent": 100,
             "charge_efficiency": 0.9,
@@ -177,6 +178,7 @@ class PowerRecommendationUnitTests(unittest.IsolatedAsyncioTestCase):
         }
         config = {
             "price_entity": "sensor.price",
+            "minimum_discharge_profit_per_kwh": 0.0,
             "min_soc_percent": 10,
             "max_soc_percent": 100,
             "charge_efficiency": 0.9,
@@ -243,6 +245,7 @@ class StartupPlanningTests(unittest.IsolatedAsyncioTestCase):
         }
         self.config = {
             "price_entity": "sensor.price",
+            "minimum_discharge_profit_per_kwh": 0.0,
             "min_soc_percent": 10,
             "max_soc_percent": 100,
             "charge_efficiency": 1.0,

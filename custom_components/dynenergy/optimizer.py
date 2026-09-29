@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time
 from enum import StrEnum
 from math import floor, isfinite
@@ -27,8 +27,14 @@ CHARGE_MARGIN_FRACTION = 0.20
 # How far above the cost basis of the stored energy a price has to climb before
 # the forecast load stops limiting the discharge.
 SPIKE_PREMIUM_PER_KWH = 0.30
+DEFAULT_MIN_DISCHARGE_PROFIT_PER_KWH = 0.15
+PRICE_EPSILON_PER_KWH = 1e-9
 # Allocations below this are rounding residue, not a usable battery instruction.
 ENERGY_EPSILON_KWH = 1e-9
+# Pool replay accumulates more floating residue than a single allocation.
+# 1e-7 kWh is 0.0004 W over a quarter, far below command resolution.
+POOL_ENERGY_TOLERANCE_KWH = 1e-7
+MAX_POOL_REFINEMENTS = 256
 
 
 class OperatingState(StrEnum):
@@ -51,6 +57,7 @@ class BatteryParameters:
     charge_efficiency: float
     discharge_efficiency: float
     degradation_cost_per_kwh: float = 0.0
+    minimum_discharge_profit_per_kwh: float = DEFAULT_MIN_DISCHARGE_PROFIT_PER_KWH
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +69,8 @@ class OptimizerInputs:
     consumption_kwh: Sequence[float]  # Load energy for each 15-minute interval.
     current_soc_percent: float
     battery: BatteryParameters
-    # Measured cost basis of the energy already in the battery. Only the part of
-    # the horizon before the first charge block depends on it.
+    # Effective acquisition cost in EUR/battery kWh, including charging losses.
+    # The coordinator converts the raw meter-account basis once at this boundary.
     stored_energy_cost_per_kwh: float | None = None
 
 
@@ -92,6 +99,8 @@ class PlanInterval:
     command_power_w: int | None = None
     command_expected_soc_percent: float | None = None
     command_grid_energy_kwh: float | None = None
+    minimum_discharge_price_per_kwh: float | None = None
+    expected_discharge_profit_per_kwh: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,10 +305,12 @@ def create_greedy_charge_plan(
                 inputs, thresholds, blocks, position, refill_needed_kwh
             ),
             spike_price_per_kwh=basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
+            profit_price_per_kwh=_profit_discharge_floor(inputs, basis, blocks, position, refill_needed_kwh),
         )
         if position >= len(blocks):
             continue
 
+        basis.retain(stored_energy_kwh)
         block = blocks[position]
         if position > allocated_through:
             _allocate_block_charge(
@@ -333,7 +344,7 @@ def create_greedy_charge_plan(
             basis.add(absorbed_charge_kwh, inputs.prices_per_kwh[index])
 
     intervals, absorbed_charge_by_index = _build_intervals(
-        inputs, charge_energy_by_index, discharge_energy_by_index, target_energy_kwh
+        inputs, charge_energy_by_index, discharge_energy_by_index, target_energy_kwh, blocks
     )
     return OptimizationPlan(
         intervals=intervals,
@@ -353,13 +364,13 @@ def create_greedy_charge_plan(
 class _CostBasis:
     """Running average price paid for the energy the plan has bought so far.
 
-    Each discharge gap is priced against the blocks already walked, so the
-    spike trigger follows what the stored energy actually cost rather than the
-    day's cheapest price. Before the first block there is nothing planned yet
-    and the measured basis carried on the inputs stands in for it.
+    The legacy spike trigger uses raw prices of previously walked charge blocks.
+    The profit gate separately tracks the weighted acquisition cost of remaining
+    battery energy, including charging losses and the opening cost basis.
     """
 
-    __slots__ = ("_cost", "_energy_kwh", "_opening_per_kwh")
+    __slots__ = ("_cost", "_energy_kwh", "_opening_per_kwh", "_battery_energy_kwh",
+                 "_battery_cost_eur", "_charge_efficiency", "_fallback_battery_price")
 
     def __init__(self, inputs: OptimizerInputs) -> None:
         self._cost = 0.0
@@ -369,17 +380,98 @@ class _CostBasis:
             if inputs.stored_energy_cost_per_kwh is not None
             else min(inputs.prices_per_kwh)
         )
+        self._charge_efficiency = inputs.battery.charge_efficiency
+        self._fallback_battery_price = (
+            inputs.stored_energy_cost_per_kwh
+            if inputs.stored_energy_cost_per_kwh is not None
+            else min(inputs.prices_per_kwh) / self._charge_efficiency
+        )
+        self._battery_energy_kwh = inputs.battery.usable_capacity_kwh * inputs.current_soc_percent / 100
+        self._battery_cost_eur = self._battery_energy_kwh * self._fallback_battery_price
 
     def add(self, energy_kwh: float, price_per_kwh: float) -> None:
         """Fold one interval's purchase into the running average."""
         self._energy_kwh += energy_kwh
         self._cost += energy_kwh * price_per_kwh
+        self._battery_energy_kwh += energy_kwh * self._charge_efficiency
+        self._battery_cost_eur += energy_kwh * price_per_kwh
 
     def per_kwh(self) -> float:
         """Return the current cost basis of the stored energy."""
         if self._energy_kwh <= ENERGY_EPSILON_KWH:
             return self._opening_per_kwh
         return self._cost / self._energy_kwh
+
+    def retain(self, remaining_battery_kwh: float) -> None:
+        """Remove discharged energy at the current weighted cost; no meter writes."""
+        unit_cost = self.battery_cost_per_kwh()
+        self._battery_energy_kwh = max(0.0, remaining_battery_kwh)
+        self._battery_cost_eur = self._battery_energy_kwh * unit_cost
+
+    def battery_cost_per_kwh(self) -> float:
+        """Forecast EUR per battery kWh, including planned charging losses."""
+        if self._battery_energy_kwh <= ENERGY_EPSILON_KWH:
+            return self._fallback_battery_price
+        return self._battery_cost_eur / self._battery_energy_kwh
+
+    def minimum_discharge_price(self, inputs: OptimizerInputs) -> float:
+        """Require net profit per delivered grid kWh, including spikes."""
+        battery = inputs.battery
+        if battery.minimum_discharge_profit_per_kwh == 0:
+            return float('-inf')  # Explicit compatibility opt-out.
+        return (self.battery_cost_per_kwh() / battery.discharge_efficiency
+                + battery.degradation_cost_per_kwh
+                + battery.minimum_discharge_profit_per_kwh)
+
+
+def projected_stored_energy_cost_per_kwh(
+    intervals: Sequence[PlanInterval], battery: BatteryParameters,
+    opening_soc: float, opening_cost_per_battery_kwh: float | None,
+) -> float:
+    """Carry forecast acquisition cost across midnight, independently of accounts."""
+    return forecast_discharge_economics(
+        intervals, battery, opening_soc, opening_cost_per_battery_kwh
+    )[1]
+
+
+def forecast_discharge_economics(
+    intervals: Sequence[PlanInterval], battery: BatteryParameters,
+    opening_soc: float, opening_cost_per_battery_kwh: float | None,
+) -> tuple[list[PlanInterval], float]:
+    """Recalculate profit attributes for effective allocations and closing basis."""
+    inputs = OptimizerInputs(
+        [i.timestamp for i in intervals], [i.price_per_kwh for i in intervals],
+        [i.consumption_kwh for i in intervals], opening_soc, battery,
+        opening_cost_per_battery_kwh,
+    )
+    basis = _CostBasis(inputs)
+    energy = battery.usable_capacity_kwh * opening_soc / 100
+    maximum = battery.usable_capacity_kwh * battery.max_soc_percent / 100
+    annotated = []
+    for interval in intervals:
+        allocation = interval.allocated_grid_energy_kwh
+        if allocation is None:
+            allocation = interval.target_battery_energy_kwh
+        floor_price = basis.minimum_discharge_price(inputs)
+        annotated.append(replace(
+            interval,
+            minimum_discharge_price_per_kwh=(max(
+                floor_price, interval.minimum_discharge_price_per_kwh
+                if interval.minimum_discharge_price_per_kwh is not None else floor_price
+            ) if isfinite(floor_price) else None),
+            expected_discharge_profit_per_kwh=(
+                interval.price_per_kwh - basis.battery_cost_per_kwh() / battery.discharge_efficiency
+                - battery.degradation_cost_per_kwh if allocation > ENERGY_EPSILON_KWH else None
+            ),
+        ))
+        if allocation < 0:
+            charge = min(-allocation, max(0, maximum-energy) / battery.charge_efficiency)
+            basis.add(charge, interval.price_per_kwh)
+            energy += charge * battery.charge_efficiency
+        else:
+            energy -= allocation / battery.discharge_efficiency
+            basis.retain(energy)
+    return annotated, basis.battery_cost_per_kwh()
 
 
 def _charge_blocks(
@@ -455,6 +547,21 @@ def _discharge_floor_per_kwh(
             _break_even_price_per_kwh(inputs, next_block, refill_needed_kwh),
         )
     return thresholds.pre_charge_discharge_per_kwh
+
+
+def _profit_discharge_floor(
+    inputs: OptimizerInputs, basis: _CostBasis,
+    blocks: Sequence[tuple[int, ...]], position: int, refill_needed_kwh: float,
+) -> float:
+    """The hard net-profit gate; spikes cannot bypass replacement economics."""
+    floor_per_kwh = basis.minimum_discharge_price(inputs)
+    if inputs.battery.minimum_discharge_profit_per_kwh > 0 and position < len(blocks):
+        floor_per_kwh = max(
+            floor_per_kwh,
+            _break_even_price_per_kwh(inputs, blocks[position], refill_needed_kwh)
+            + inputs.battery.minimum_discharge_profit_per_kwh,
+        )
+    return floor_per_kwh
 
 
 def _break_even_price_per_kwh(
@@ -586,7 +693,7 @@ def _allocate_grouped_charge(
         stored_energy_kwh, basis,
     )
     minimum_shares: dict[int, float] = {}
-    while True:
+    for _ in range(MAX_POOL_REFINEMENTS):
         _allocate_bucket_charge(
             inputs, charge_energy_by_index, pools, requested_kwh, minimum_shares
         )
@@ -603,6 +710,7 @@ def _allocate_grouped_charge(
                 projected_kwh = minimum_kwh + _allocate_discharge(
                     inputs, projected_discharge, projected_kwh - minimum_kwh,
                     gaps[position], floor_per_kwh, spike_per_kwh,
+                    _profit_discharge_floor(inputs, projected_basis, blocks, position, target_kwh - minimum_kwh),
                 )
                 # Pooling must not defer energy needed for an existing profit
                 # opportunity. Recheck eligibility against the pooled cost basis.
@@ -610,19 +718,21 @@ def _allocate_grouped_charge(
                 _allocate_discharge(
                     inputs, eligible_discharge, target_kwh - minimum_kwh,
                     gaps[position], floor_per_kwh, spike_per_kwh,
+                    _profit_discharge_floor(inputs, projected_basis, blocks, position, target_kwh - minimum_kwh),
                 )
                 shortage_kwh = sum(
                     max(0.0, min(original_discharge[index], eligible_discharge[index])
                         - projected_discharge[index])
                     for index in gaps[position]
                 ) / (battery.charge_efficiency * battery.discharge_efficiency)
-                if shortage_kwh > ENERGY_EPSILON_KWH:
+                if shortage_kwh > POOL_ENERGY_TOLERANCE_KWH:
                     reserved_earlier_charge = _reserve_charge_before_gap(
                         inputs, pools, charge_energy_by_index, minimum_shares,
                         gaps[position].start, shortage_kwh,
                     )
                     if reserved_earlier_charge:
                         break
+            projected_basis.retain(projected_kwh)
             for index in blocks[position]:
                 absorbed_kwh = _absorbed_charge_kwh(
                     battery, charge_energy_by_index[index], projected_kwh, target_kwh
@@ -648,9 +758,10 @@ def _allocate_grouped_charge(
             / battery.charge_efficiency,
         )
         next_request_kwh = min(capacity_kwh, required_kwh)
-        if next_request_kwh <= requested_kwh + ENERGY_EPSILON_KWH:
+        if next_request_kwh <= requested_kwh + POOL_ENERGY_TOLERANCE_KWH:
             return
         requested_kwh = next_request_kwh
+    raise ValueError("Greedy charge pooling did not converge")
 
 
 def _reserve_charge_before_gap(
@@ -705,7 +816,9 @@ def _unpooled_discharge(
                     inputs, thresholds, blocks, position, target_kwh - minimum_kwh
                 ),
                 projected_basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
+                _profit_discharge_floor(inputs, projected_basis, blocks, position, target_kwh - minimum_kwh),
             )
+        projected_basis.retain(stored_energy_kwh)
         block = blocks[position]
         _allocate_block_charge(inputs, charges, block, stored_energy_kwh, target_kwh)
         if _can_defer_block_charge(
@@ -783,10 +896,12 @@ def _can_defer_block_charge(
         charged_kwh = minimum_kwh + _allocate_discharge(
             inputs, charged_discharge, charged_kwh - minimum_kwh, gap,
             floor_per_kwh, charged_basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
+            _profit_discharge_floor(inputs, charged_basis, blocks, later_position, target_kwh - minimum_kwh),
         )
         deferred_kwh = minimum_kwh + _allocate_discharge(
             inputs, deferred_discharge, deferred_kwh - minimum_kwh, gap,
             floor_per_kwh, basis.per_kwh() + SPIKE_PREMIUM_PER_KWH,
+            _profit_discharge_floor(inputs, basis, blocks, later_position, target_kwh - minimum_kwh),
         )
         if any(
             deferred_discharge[index] + ENERGY_EPSILON_KWH
@@ -882,14 +997,22 @@ def _build_intervals(
     charge_energy_by_index: Sequence[float],
     discharge_energy_by_index: Sequence[float],
     target_energy_kwh: float,
+    charge_blocks: Sequence[tuple[int, ...]] = (),
 ) -> tuple[list[PlanInterval], list[float]]:
     """Render the allocations as plan intervals and the energy actually stored."""
     battery = inputs.battery
     intervals: list[PlanInterval] = []
     absorbed_charge_by_index: list[float] = []
     expected_energy_kwh = battery.usable_capacity_kwh * inputs.current_soc_percent / 100
+    basis = _CostBasis(inputs)
 
     for index, timestamp in enumerate(inputs.timestamps):
+        position = sum(block[-1] < index for block in charge_blocks)
+        profit_floor = _profit_discharge_floor(
+            inputs, basis, charge_blocks, position,
+            battery.usable_capacity_kwh * (battery.max_soc_percent - battery.min_soc_percent) / 100,
+        )
+        delivered_cost = basis.battery_cost_per_kwh() / battery.discharge_efficiency
         commanded_charge_kwh = charge_energy_by_index[index]
         discharge_energy_kwh = discharge_energy_by_index[index]
         absorbed_charge_kwh = _absorbed_charge_kwh(
@@ -898,6 +1021,8 @@ def _build_intervals(
         absorbed_charge_by_index.append(absorbed_charge_kwh)
         expected_energy_kwh += absorbed_charge_kwh * battery.charge_efficiency
         expected_energy_kwh -= discharge_energy_kwh / battery.discharge_efficiency
+        basis.add(absorbed_charge_kwh, inputs.prices_per_kwh[index])
+        basis.retain(expected_energy_kwh)
         intervals.append(
             PlanInterval(
                 timestamp=timestamp,
@@ -920,6 +1045,11 @@ def _build_intervals(
                 ),
                 allocated_grid_energy_kwh=(
                     -absorbed_charge_kwh if commanded_charge_kwh > 0 else discharge_energy_kwh
+                ),
+                minimum_discharge_price_per_kwh=profit_floor if isfinite(profit_floor) else None,
+                expected_discharge_profit_per_kwh=(
+                    inputs.prices_per_kwh[index] - delivered_cost - battery.degradation_cost_per_kwh
+                    if discharge_energy_kwh > 0 else None
                 ),
             )
         )
@@ -999,6 +1129,7 @@ def _allocate_discharge(
     candidate_indices: Sequence[int],
     minimum_price_per_kwh: float,
     spike_price_per_kwh: float,
+    profit_price_per_kwh: float,
 ) -> float:
     """Allocate stored energy to the highest-priced eligible demand intervals.
 
@@ -1013,10 +1144,11 @@ def _allocate_discharge(
         (
             index
             for index in candidate_indices
-            if _is_price_spike(inputs, index, spike_price_per_kwh)
-            or (
-                inputs.prices_per_kwh[index] >= minimum_price_per_kwh
-                and inputs.consumption_kwh[index] > 0
+            if inputs.prices_per_kwh[index] + PRICE_EPSILON_PER_KWH >= profit_price_per_kwh
+            and (
+                _is_price_spike(inputs, index, spike_price_per_kwh)
+                or (inputs.prices_per_kwh[index] >= minimum_price_per_kwh
+                    and inputs.consumption_kwh[index] > 0)
             )
         ),
         key=lambda index: (-inputs.prices_per_kwh[index], inputs.timestamps[index].timestamp()),
@@ -1081,10 +1213,13 @@ def _validate_charge_inputs(
         battery.max_discharge_power_kw, battery.min_soc_percent,
         battery.max_soc_percent, battery.charge_efficiency,
         battery.discharge_efficiency, battery.degradation_cost_per_kwh,
+        battery.minimum_discharge_profit_per_kwh,
         inputs.current_soc_percent, charge_price_threshold_per_kwh,
         *inputs.prices_per_kwh, *inputs.consumption_kwh,
     )):
         raise ValueError("Optimizer inputs must be finite")
+    if inputs.stored_energy_cost_per_kwh is not None and not isfinite(inputs.stored_energy_cost_per_kwh):
+        raise ValueError("Stored-energy cost must be finite")
     if (
         battery.usable_capacity_kwh <= 0
         or battery.max_charge_power_kw <= 0
@@ -1097,5 +1232,7 @@ def _validate_charge_inputs(
         raise ValueError("Battery SOC limits must be ordered percentages between 0 and 100")
     if not 0 <= inputs.current_soc_percent <= 100:
         raise ValueError("Current SOC must be a percentage between 0 and 100")
+    if battery.minimum_discharge_profit_per_kwh < 0:
+        raise ValueError("Minimum discharge profit must not be negative")
     if charge_price_threshold_per_kwh < 0:
         raise ValueError("Charge price threshold must not be negative")

@@ -20,6 +20,7 @@ class _CrossDayFixture(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 9, 14, 15, 30, tzinfo=UTC)
         self.tomorrow = datetime(2026, 9, 15, tzinfo=UTC)
         self.config = {
+            'minimum_discharge_profit_per_kwh': 0.0,
             'price_entity': 'sensor.price', 'min_soc_percent': 0, 'max_soc_percent': 100,
             'charge_efficiency': 1, 'discharge_efficiency': 1, 'cycle_cancellation_debug': True,
             'charge_price_threshold': .3, 'charge_power_target_entity': 'input_number.target',
@@ -344,3 +345,75 @@ class PersistenceAuditTests(_CrossDayFixture):
         await self.compare()
         self.assertEqual(self.coordinator._revision, 1)
         self.assertEqual(len(self.coordinator.data.plan.intervals), 130)
+
+class MinimumProfitIntegrationTests(_CrossDayFixture):
+    async def test_default_net_profit_gate_reaches_midnight_forecast_and_helper(self):
+        from custom_components.dynenergy.accounting import BatteryCostAccount
+        self.config.pop('minimum_discharge_profit_per_kwh')
+        self.states['sensor.soc_entity'].state = '0'
+        c = self.coordinator
+        c._account = BatteryCostAccount().initialize(0, 0, 0, 0)
+        account_before = c._account.as_dict()
+        battery = c._battery_parameters(c._read_data())
+        self.assertEqual(battery.minimum_discharge_profit_per_kwh, .15)
+        today = cycles.replay(slots([0]*33+[-1], [.25]*33+[.10], start=self.now), battery, 0)
+        c.data = c._read_data(today)
+        # Expensive-enough-for-the-old-price-band morning, followed by a cheap refill.
+        tomorrow_prices = [.16]*48+[.08]*16+[.17]*32
+        self.rows = [{'start_time': (self.tomorrow+timedelta(minutes=15*n)).isoformat(),
+                      'end_time': (self.tomorrow+timedelta(minutes=15*(n+1))).isoformat(),
+                      'price_per_kwh': p} for n,p in enumerate(tomorrow_prices)]
+        self.states['sensor.price'].attributes = {'data': self.rows}
+        c._create_charge_plan = cm.DynEnergyCoordinator._create_charge_plan.__get__(c)
+        await self.compare()
+        self.assertIsNone(c.data.planning_error)
+        self.assertEqual(c.data.plan.summary.total_discharge_kwh, 0)
+        self.assertAlmostEqual(c.data.comparison['projected_tomorrow_stored_cost_per_battery_kwh'], .10)
+        self.now = self.tomorrow+timedelta(hours=8)
+        await c._async_apply_scheduled_power(self.now)
+        power = sensor_module.DynEnergyPowerRecommendationSensor(c, self.entry)
+        self.assertEqual(power.native_value, 0)
+        self.assertEqual(self.hass.services.async_call.call_args.args[2]['value'], 0)
+        plan_sensor = sensor_module.DynEnergyPlanSensor(c, self.entry)
+        self.assertEqual(plan_sensor.extra_state_attributes['minimum_discharge_profit_per_kwh'], .15)
+        self.assertEqual(c._account.as_dict(), account_before)
+
+    async def test_pre_profit_policy_saved_plan_is_not_executed_after_upgrade(self):
+        await self.compare()
+        self.saved['version'] = 1
+        self.config.pop('minimum_discharge_profit_per_kwh')
+        restored = cm.DynEnergyCoordinator(self.hass, self.entry)
+        restored._plan_store = self.store
+        self.assertFalse(await restored._async_load_saved_plan(self.now))
+        self.assertIsNone(restored.data)
+
+    async def test_changed_minimum_profit_invalidates_saved_plan(self):
+        await self.compare()
+        self.config['minimum_discharge_profit_per_kwh'] = .20
+        restored = cm.DynEnergyCoordinator(self.hass, self.entry)
+        restored._plan_store = self.store
+        self.assertFalse(await restored._async_load_saved_plan(self.now))
+
+    async def test_raw_meter_basis_and_projected_basis_include_losses_exactly_once(self):
+        from custom_components.dynenergy.accounting import BatteryCostAccount
+        self.config.pop('minimum_discharge_profit_per_kwh')
+        self.config.update(charge_efficiency=.8, discharge_efficiency=.9, degradation_cost=.02)
+        c = self.coordinator
+        c._account = BatteryCostAccount().initialize(0, 0, 5, .10)
+        c._create_charge_plan = cm.DynEnergyCoordinator._create_charge_plan.__get__(c)
+        threshold = .10/(.8*.9)+.02+.15
+        self.states['sensor.price'].attributes = {'data': [{
+            'start_time': self.tomorrow.isoformat(),
+            'end_time': (self.tomorrow+timedelta(minutes=15)).isoformat(),
+            'price_per_kwh': threshold,
+        }]}
+        data = c._read_data()
+        from_meter = c._create_charge_plan(data, self.tomorrow.date())
+        from_forecast = c._create_charge_plan(
+            replace(data, forecast_opening_cost_per_battery_kwh=.125), self.tomorrow.date())
+        for candidate in (from_meter, from_forecast):
+            slot = candidate.intervals[0]
+            self.assertGreater(slot.target_battery_energy_kwh, 0)
+            self.assertAlmostEqual(slot.minimum_discharge_price_per_kwh, threshold)
+            self.assertAlmostEqual(slot.expected_discharge_profit_per_kwh, .15)
+        self.assertAlmostEqual(c._account.stored_energy_cost_per_kwh, .10)

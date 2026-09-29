@@ -21,6 +21,49 @@ sorting and interval selection use absolute time, including both occurrences of
 the repeated autumn hour. Local dates determine day and block membership.
 Consequently 23/25-hour days contain 92/100 quarters.
 
+## Discharge eligibility before cancellation
+
+The greedy planner now requires `minimum_discharge_profit_per_kwh` (default 0.15)
+net EUR per delivered kWh before authorizing any discharge. This applies to spikes,
+ordinary demand, before/after charging, pooled blocks and lookahead simulations.
+Setting it to zero explicitly opts out of the additional profit requirement.
+
+A separate forecast ledger combines the opening acquisition cost with subsequent
+absorbed purchases and removes discharged energy at weighted cost. Purchases cost
+`grid_charge_kwh * price` and add `grid_charge_kwh * charge_efficiency` battery kWh.
+A stored battery kWh costs `basis / discharge_efficiency` per delivered grid kWh.
+The gate adds configured degradation and the required net profit to that delivered
+cost. It also applies to the estimated replacement cost when a refill block follows;
+cheap old energy must not justify an extra low-margin refill cycle. Ordinary daily
+price bands and demand/power/SOC limits still apply. Equality is eligible.
+
+Measured accounting deliberately multiplies battery-side meter deltas by raw EPEX
+prices without efficiency adjustments. Its basis is therefore divided by charge
+efficiency once when entering this forecast. The already-adjusted forecast basis
+is carried across midnight explicitly, without applying charging losses twice or
+changing the account. If acquisition history is unavailable, the existing fallback
+to the lowest horizon price remains an estimate, not a known historical purchase.
+
+The required 15 ct profit does not replace or get added to the 6 ct cancellation
+allowance. The former determines greedy discharge eligibility; the latter compares
+matched optional cycles. Ten-cent purchases followed by sixteen-cent discharge
+fail the profit gate even when the old daily price bands would allow discharge.
+The greedy charging target itself remains unchanged: energy can be bought and held
+for a future opportunity rather than discharged at an inadequate margin.
+
+Per-slot `minimum_discharge_price_per_kwh` reports the economic gate (daily price
+bands can impose a stricter threshold). `expected_discharge_profit_per_kwh` reports
+net profit against the weighted stored basis for the effective discharge; idle
+and charge slots report no discharge profit. `minimum_discharge_profit_per_kwh`
+and the projected tomorrow battery-side acquisition cost appear on Battery plan.
+
+Saved-plan policy version 2 invalidates earlier plans that did not enforce this
+minimum. Those schedules are rebuilt on startup; accounting storage is unaffected.
+Charge pooling uses a 1e-7 kWh convergence tolerance (below one-Watt resolution)
+and at most 256 refinements, preventing a floating-point residual from indefinitely
+blocking the coordinator. Non-convergence is a planning error and retains the
+previous valid schedule.
+
 ## Units and economics
 
 - Slot targets and physical allocations are signed **grid-side kWh**: charging

@@ -9,7 +9,7 @@ from custom_components.dynenergy import cycle_cancellation as cycles
 
 START = datetime(2026, 9, 14, 23, 45, tzinfo=UTC)
 TOMORROW = (START + timedelta(days=1)).date()
-BATTERY = opt.BatteryParameters(10, 20, 20, 0, 100, 1, 1)
+BATTERY = opt.BatteryParameters(10, 20, 20, 0, 100, 1, 1, minimum_discharge_profit_per_kwh=0)
 
 
 def slots(energies, prices=None, loads=None, start=START):

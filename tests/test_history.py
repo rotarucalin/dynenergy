@@ -266,6 +266,7 @@ class ConsumptionHistoryTests(unittest.IsolatedAsyncioTestCase):
                 consumption_kwh=[profile.consumption_kwh(timestamp) for timestamp in timestamps],
                 current_soc_percent=14,  # Enough stored energy for the full load.
                 battery=optimizer.BatteryParameters(
+                    minimum_discharge_profit_per_kwh=0.0,
                     usable_capacity_kwh=2.0,
                     max_charge_power_kw=1.5, max_discharge_power_kw=1.5,
                     min_soc_percent=10, max_soc_percent=100,

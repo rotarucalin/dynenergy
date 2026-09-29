@@ -26,6 +26,7 @@ from .const import (
     CONF_MAX_DISCHARGE_POWER_ENTITY,
     CONF_MAX_SOC_PERCENT,
     CONF_MIN_SOC_PERCENT,
+    CONF_MIN_DISCHARGE_PROFIT,
     CONF_PRICE_ENTITY,
     CONF_SOC_ENTITY,
     DOMAIN,
@@ -89,6 +90,10 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_DISCHARGE_EFFICIENCY,
                 default=defaults.get(CONF_DISCHARGE_EFFICIENCY, 0.95),
             ): vol.All(vol.Coerce(float), vol.Range(min=0.01, max=1)),
+            vol.Optional(
+                CONF_MIN_DISCHARGE_PROFIT,
+                default=defaults.get(CONF_MIN_DISCHARGE_PROFIT, 0.15),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0)),
             vol.Optional(
                 CONF_CYCLE_COST, default=defaults.get(CONF_CYCLE_COST, 0.06)
             ): vol.All(vol.Coerce(float), vol.Range(min=0)),
