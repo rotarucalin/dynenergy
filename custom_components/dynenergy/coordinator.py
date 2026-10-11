@@ -107,6 +107,7 @@ class DynEnergyCoordinator(CrossDayPlanning, DataUpdateCoordinator[DynEnergyData
         self._comparison = {}
         self._comparison_debug = {}
         self._compared_date = None
+        self._reload_planning_pending = False
         self._revision = 0
         self._plan_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.plan")
         self._unsub_plan: Callable[[], None] | None = None
@@ -124,8 +125,9 @@ class DynEnergyCoordinator(CrossDayPlanning, DataUpdateCoordinator[DynEnergyData
         )
         self._consumption_profile = optimizer.WeeklyConsumptionProfile.default()
 
-    async def async_start(self) -> None:
+    async def async_start(self, *, force_replan: bool = False) -> None:
         """Start daily planning and 15-minute charge target updates."""
+        self._reload_planning_pending = force_replan
         self._account = BatteryCostAccount.from_dict(
             await self._account_store.async_load()
         )

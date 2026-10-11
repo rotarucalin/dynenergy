@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 from . import optimizer
 from .const import DOMAIN, PLATFORMS
 
+_RELOAD_PENDING = f"{DOMAIN}_reload_pending"
+
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
@@ -23,8 +25,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = DynEnergyCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    await coordinator.async_start()
+    reload_entries = hass.data.get(_RELOAD_PENDING, set())
+    await coordinator.async_start(force_replan=entry.entry_id in reload_entries)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    reload_entries.discard(entry.entry_id)
     return True
 
 
@@ -35,4 +39,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
         if coordinator is not None:
             await coordinator.async_shutdown()
+            hass.data.setdefault(_RELOAD_PENDING, set()).add(entry.entry_id)
     return unloaded

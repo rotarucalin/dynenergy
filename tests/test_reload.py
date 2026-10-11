@@ -270,6 +270,125 @@ class OptimizerReloadTests(unittest.IsolatedAsyncioTestCase):
             previous = coordinator
         self.assertEqual(self.reload.call_count, 3)
 
+    def set_cross_day_prices(self, *, tomorrow_count=96):
+        start = self.now.replace(hour=0, minute=0, second=0, microsecond=0)
+        self.states["sensor.price"].attributes["data"] = [{
+            "start_time": (start + timedelta(minutes=15 * index)).isoformat(),
+            "end_time": (start + timedelta(minutes=15 * (index + 1))).isoformat(),
+            "price_per_kwh": 0.02 if 96 <= index < 104 else 0.40 if index >= 128 else 0.20,
+        } for index in range(96 + tomorrow_count)]
+
+    async def test_reload_rebuilds_both_days_after_threshold_and_code_change(self):
+        self.now = self.now.replace(hour=15, minute=30)
+        coordinator_module.dt_util.now.return_value = self.now
+        self.set_cross_day_prices()
+        original = await self.setup_entry()
+        self.assertEqual(original._revision, 1)
+        self.assertGreater(original._baseline.summary.total_charge_kwh, 0)
+        account = original._account.as_dict()
+        await self.unload_entry()
+
+        # This threshold is outside BatteryParameters, so the saved plan remains
+        # valid for restoration. Reload must nevertheless replace its candidates.
+        self.entry.data["charge_price_threshold"] = 0.01
+        self.loaded_idle_kwh = 0.080
+        coordinator = await self.setup_entry()
+        self.assertEqual(coordinator._revision, 2)
+        self.assertEqual(coordinator.data.comparison["rebuild_reason"], "reload")
+        self.assertFalse(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator._baseline.summary.total_charge_kwh, 0)
+        self.assertEqual(coordinator.data.plan.summary.total_charge_kwh, 0)
+        self.assertEqual(coordinator._account.as_dict(), account)
+        self.assertEqual(optimizer.create_greedy_charge_plan.call_count, 2)
+        for call in optimizer.create_greedy_charge_plan.call_args_list:
+            self.assertEqual(call.args[1], 0.01)
+            self.assertIn(0.080, call.args[0].consumption_kwh)
+        await self.unload_entry()
+
+    async def test_reload_recalculates_cancellations_after_cycle_allowance_change(self):
+        self.now = self.now.replace(hour=15, minute=30)
+        coordinator_module.dt_util.now.return_value = self.now
+        self.set_cross_day_prices()
+        original = await self.setup_entry()
+        self.assertEqual(original.data.comparison["cancelled_discharge_grid_kwh"], 0)
+        await self.unload_entry()
+        self.entry.data["cycle_cost_per_kwh"] = 0.30
+        coordinator = await self.setup_entry()
+        self.assertEqual(coordinator._revision, 2)
+        self.assertEqual(coordinator.data.comparison["rebuild_reason"], "reload")
+        self.assertGreater(coordinator.data.comparison["cancelled_discharge_grid_kwh"], 0)
+        self.assertEqual(coordinator.data.plan.intervals[0].target_battery_energy_kwh, 0)
+        self.assertEqual(self.entities[1].native_value, 0)
+        await self.unload_entry()
+
+    async def test_reload_before_1530_defers_to_boundary_and_retries_missing_prices(self):
+        self.now = self.now.replace(hour=12, minute=0)
+        coordinator_module.dt_util.now.return_value = self.now
+        self.set_cross_day_prices()
+        original = await self.setup_entry()
+        # Publish an existing comparison to verify that a saved date cannot skip
+        # the reload request, including when reloading before the daily trigger.
+        await original._async_compare(self.now)
+        self.assertEqual(original._revision, 1)
+        await self.unload_entry()
+
+        self.now += timedelta(minutes=7)
+        coordinator_module.dt_util.now.return_value = self.now
+        self.set_cross_day_prices(tomorrow_count=95)
+        coordinator = await self.setup_entry()
+        self.assertTrue(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator._revision, 1)
+        optimizer.create_greedy_charge_plan.assert_not_called()
+        active = coordinator.data.plan
+
+        self.now = self.now.replace(minute=15)
+        coordinator_module.dt_util.now.return_value = self.now
+        await coordinator._async_maintain_plan(self.now)
+        self.assertTrue(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator._revision, 1)
+        self.assertEqual(coordinator.data.comparison["comparison_status"], "retry_pending")
+        self.assertEqual(coordinator.data.plan.intervals, active.intervals[1:])
+
+        self.set_cross_day_prices()
+        save = coordinator._plan_store.async_save.side_effect
+        coordinator._plan_store.async_save.side_effect = OSError("disk full")
+        await coordinator._async_maintain_plan(self.now)
+        self.assertTrue(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator._revision, 1)
+        self.assertIn("disk full", coordinator.data.planning_error)
+        self.assertEqual(coordinator.data.plan.intervals, active.intervals[1:])
+        coordinator._plan_store.async_save.side_effect = save
+        await coordinator._async_maintain_plan(self.now)
+        self.assertEqual(coordinator._revision, 2)
+        self.assertFalse(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator.data.comparison["rebuild_reason"], "reload")
+        self.assertIsNone(coordinator.data.planning_error)
+        await coordinator._async_maintain_plan(self.now)
+        self.assertEqual(coordinator._revision, 2)
+        await self.unload_entry()
+
+    async def test_reload_with_changed_battery_parameters_replans_after_inputs_recover(self):
+        self.now = self.now.replace(hour=15, minute=30)
+        coordinator_module.dt_util.now.return_value = self.now
+        self.set_cross_day_prices()
+        await self.setup_entry()
+        await self.unload_entry()
+        self.entry.data["minimum_discharge_profit_per_kwh"] = 1.0
+        self.states[self.entry.data["soc_entity"]].state = "unavailable"
+        coordinator = await self.setup_entry()
+        self.assertIsNone(coordinator.data.plan)
+        self.assertTrue(coordinator._reload_planning_pending)
+        self.assertEqual(len(self.callbacks), 3)
+
+        self.states[self.entry.data["soc_entity"]].state = "50"
+        await coordinator._async_retry_startup_plan(self.now)
+        self.assertIsNotNone(coordinator.data.plan)
+        self.assertFalse(coordinator._reload_planning_pending)
+        self.assertEqual(coordinator.data.comparison["rebuild_reason"], "reload")
+        self.assertEqual(coordinator.data.plan.summary.total_discharge_kwh, 0)
+        self.assertEqual(len(self.callbacks), 2)
+        await self.unload_entry()
+
     async def test_cached_sensor_and_coordinator_read_replaced_functions_and_constants(self):
         coordinator = await self.setup_entry()
         with patch.object(optimizer, "target_power_w", return_value=777):

@@ -181,7 +181,21 @@ remains visible during candidate construction. Only a completely validated,
 successfully persisted candidate is published. Price, planning or storage failures
 retain the active plan and expose a reason with `retry_pending`. Quarter-hour
 callbacks retry after 15:30. Repeated callbacks for an already compared date do not
-apply reductions again.
+apply reductions again, except when an integration reload explicitly requests a
+new comparison.
+
+A successful entry unload marks its next setup in the same HA instance as a
+reload. That setup requests fresh greedy candidates for today's remainder and
+tomorrow from measured SOC, refreshed prices, the rebuilt consumption profile and
+current configuration. It bypasses the saved comparison date and runs even before
+15:30 when tomorrow's complete prices are available. It never uses previously
+reduced allocations as new greedy candidates. Reloads between quarter boundaries
+defer to the next boundary. The request remains pending through input, price,
+planning or storage failures and retries each quarter, retaining the last valid
+schedule where possible. An expired schedule falls back to current-day planning
+while comparison remains pending. Successful publication clears the request and
+reports `rebuild_reason: reload`. A normal HA restart still restores its saved
+schedule without forcing a new comparison.
 
 The legacy 23:50 callback refreshes the consumption profile and preserves any
 adjusted plan. Comparison requested between boundaries defers to the next quarter;

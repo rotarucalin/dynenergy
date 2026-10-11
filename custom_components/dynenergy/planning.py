@@ -61,11 +61,13 @@ class CrossDayPlanning:
             expected = self._predicted_soc(self.data.plan, now, battery)
             drift = expected is not None and abs(expected - data.current_soc_percent) > SOC_DRIFT_PERCENTAGE_POINTS
             boundary = now.minute % 15 == 0 and now.second == 0
-            if drift and boundary:
+            if self._reload_planning_pending:
+                await self._async_compare(now)
+            elif drift and boundary:
                 await self._async_compare(now, rebuild=True)
             elif (local.hour, local.minute) >= (15, 30):
                 await self._async_compare(now)
-            elif not self._remaining(self.data.plan, now):
+            if not self._remaining(self.data.plan, now):
                 await self._async_refresh_plan(local.date(), now)
             if self.data.plan:
                 remaining = self._remaining(self.data.plan, now)
@@ -95,7 +97,11 @@ class CrossDayPlanning:
                 return
             local = dt_util.as_local(now)
             tomorrow = local.date() + timedelta(days=1)
-            if not rebuild and self._compared_date is not None and self._compared_date >= tomorrow:
+            reload_requested = self._reload_planning_pending
+            if (
+                not rebuild and not reload_requested
+                and self._compared_date is not None and self._compared_date >= tomorrow
+            ):
                 return
             previous = self.data.plan if self.data else None
             try:
@@ -103,12 +109,23 @@ class CrossDayPlanning:
                 # measured SOC must anchor a complete remaining interval.
                 if now.minute % 15 or now.second or now.microsecond:
                     return
+                if reload_requested:
+                    # A reload can change planning policy or optimizer code. Both
+                    # days need fresh candidates, even after today's comparison.
+                    await self.hass.services.async_call(
+                        "homeassistant", "update_entity",
+                        {"entity_id": self.entry.data[CONF_PRICE_ENTITY]}, blocking=True,
+                    )
+                    if self._shutting_down:
+                        return
                 data = self._read_data()
                 self._validate_plan_inputs(data)
                 battery = self._battery_parameters(data)
                 snapshot = self._remaining(previous, now) if previous else []
                 today_slots = [i for i in snapshot if i.timestamp.date() == local.date()]
-                if rebuild:
+                if reload_requested:
+                    today = self._create_charge_plan(data, local.date(), now)
+                elif rebuild:
                     source = self._remaining(self._baseline, now) if self._baseline else snapshot
                     today_source = [i for i in source if i.timestamp.date() == local.date()]
                     today = self._greedy_from_slots(today_source, battery, data.current_soc_percent, data.account)
@@ -143,17 +160,18 @@ class CrossDayPlanning:
                 forecast_data = replace(data, current_soc_percent=projected_soc,
                                         forecast_opening_cost_per_battery_kwh=projected_cost)
                 future = [i for i in self._baseline.intervals if i.timestamp.date() == tomorrow] if self._baseline else []
-                if rebuild and future:
+                if rebuild and future and not reload_requested:
                     next_day = self._greedy_from_slots(
                         future, battery, projected_soc, data.account, opening_cost=projected_cost
                     )
-                elif rebuild and (local.hour, local.minute) < (15, 30):
+                elif rebuild and not reload_requested and (local.hour, local.minute) < (15, 30):
                     next_day = None
                 else:
-                    await self.hass.services.async_call(
-                        "homeassistant", "update_entity",
-                        {"entity_id": self.entry.data[CONF_PRICE_ENTITY]}, blocking=True,
-                    )
+                    if not reload_requested:
+                        await self.hass.services.async_call(
+                            "homeassistant", "update_entity",
+                            {"entity_id": self.entry.data[CONF_PRICE_ENTITY]}, blocking=True,
+                        )
                     if self._shutting_down:
                         return
                     self._target_day_prices(tomorrow, require_complete=True)
@@ -178,7 +196,7 @@ class CrossDayPlanning:
                                'soc_drift_tolerance_percentage_points': SOC_DRIFT_PERCENTAGE_POINTS,
                                'minimum_discharge_profit_per_kwh': battery.minimum_discharge_profit_per_kwh,
                                'projected_tomorrow_stored_cost_per_battery_kwh': projected_cost,
-                               'rebuild_reason': 'soc_drift' if rebuild else 'daily_comparison'}
+                               'rebuild_reason': 'reload' if reload_requested else 'soc_drift' if rebuild else 'daily_comparison'}
                 compared_date = tomorrow if next_day else local.date()
                 payload = {'version': PLAN_POLICY_VERSION, 'battery': asdict(battery), 'opening_soc': data.current_soc_percent,
                            'baseline': cycles.serialize_plan(result.baseline),
@@ -199,6 +217,7 @@ class CrossDayPlanning:
             self._comparison_debug = result.debug
             self._compared_date = compared_date
             self._revision = revision
+            self._reload_planning_pending = False
             self.async_set_updated_data(self._read_data(result.adjusted, monitoring_error=(
                 self.data.monitoring_error if self.data else None)))
             self._cancel_startup_retry()

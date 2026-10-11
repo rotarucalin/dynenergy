@@ -85,7 +85,13 @@ and the requested day's EPEX prices. While sources are unavailable, DynEnergy
 checks every five seconds without blocking integration setup. Once they are
 ready, it restores a valid dated schedule or generates today's remaining plan,
 then applies the current interval's target. Cross-day comparison starts at 15:30
-and retries on subsequent quarter-hour boundaries. The legacy 23:50 callback
+and retries on subsequent quarter-hour boundaries. Reloading the integration,
+including a reload after reconfiguration, forces fresh greedy schedules for both
+today's remainder and tomorrow, followed by a new cross-day comparison. This also
+runs before 15:30 when complete tomorrow prices are available. A reload between
+quarter-hour boundaries waits for the next boundary. Missing prices or failed
+planning/storage leave the request pending for quarter-hour retries, retaining
+the previous valid schedule where possible. The legacy 23:50 callback
 refreshes consumption history and preserves the adjusted schedule; comparisons
 started between boundaries wait for the next quarter.
 
@@ -421,10 +427,14 @@ load the updated setup, coordinator, and sensor modules. Subsequent edits to
 DynEnergy config entry under **Settings > Devices & services**.
 
 Entry setup reloads only the optimizer module, creates a fresh coordinator,
-rebuilds the consumption profile, restores accounting and the dated adjusted
-schedule (or generates a startup plan) before loading the sensors. If required
-inputs are still unavailable, the
-existing five-second readiness check applies. Unloading retains the safe 0 W target,
+rebuilds the consumption profile and restores accounting. On Home Assistant
+startup it restores the dated adjusted schedule or generates a startup plan.
+An integration reload additionally requests a fresh cross-day comparison from
+current SOC, refreshed prices, the new optimizer code and current configuration;
+it does not reuse the saved candidates or skip an already compared date.
+Comparison waits for a quarter-hour boundary and complete tomorrow prices.
+If required inputs are still unavailable, the existing five-second readiness
+check applies. Unloading retains the safe 0 W target,
 so a reload can briefly interrupt battery operation. Changes outside
 `optimizer.py` still require a Home Assistant restart.
 
