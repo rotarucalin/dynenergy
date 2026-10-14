@@ -673,6 +673,41 @@ def test_small_late_morning_dip_waits_for_midday_charging(efficiency) -> None:
     assert plan.summary.total_charge_kwh == pytest.approx(1.8 / efficiency)
 
 
+def test_reported_midday_plan_skips_1145_and_uses_1300() -> None:
+    """The reported 4.16 kWh battery can refill using only the cheaper midday run."""
+    prices = [
+        .2, .1905, .184, .1826, .2003, .1822, .1797, .1744,
+        .1774, .17, .1738, .1682, .1672, .1728, .1692, .1664,
+        .1695, .1639, .166, .1656, .1654, .1693, .1752, .1863,
+        .1914, .2061, .2194, .2291, .226, .2334, .241, .2492,
+        .2698, .2623, .25, .2298, .2586, .2342, .2075, .182,
+        .2142, .2007, .1856, .1693, .1707, .1595, .1427, .1318,
+        .1345, .1164, .106, .0979, .1001, .0981, .0937, .091,
+        .0892, .0956, .1059, .1119, .1044, .122, .141, .1436,
+        .1493, .165, .1793, .2048, .1949, .224, .2332, .242,
+        .236, .2391, .2466, .2602, .2599, .2643, .2608, .2608,
+        .25, .235, .2287, .2127, .226, .2172, .204, .1857,
+        .2098, .2, .1986, .1948, .1975, .1925, .193, .1795,
+    ]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=52.801947345231646, battery=_battery(
+            usable_capacity_kwh=4.16, max_charge_power_kw=1.25,
+            max_discharge_power_kw=1.1, max_soc_percent=80,
+            charge_efficiency=.9, discharge_efficiency=.9,
+            minimum_discharge_profit_per_kwh=.12,
+        ), stored_energy_cost_per_kwh=.12395807283505433),
+        consumption_kwh=[.08310950913945257] * INTERVALS_PER_DAY,
+    )
+    plan = create_greedy_charge_plan(inputs, .15)
+
+    assert plan.intervals[47].state is OperatingState.IDLE  # 11:45, 13.18 ct/kWh.
+    assert plan.intervals[52].state is OperatingState.CHARGE  # 13:00, 10.01 ct/kWh.
+    assert plan.intervals[55].expected_soc_percent == pytest.approx(80)
+    assert plan.intervals[-1].expected_soc_percent == pytest.approx(68.90097367261583)
+    assert plan.summary.total_charge_kwh == pytest.approx(1.2571544338204041)
+    assert plan.summary.highest_charge_price_per_kwh == pytest.approx(.106)
+
+
 @pytest.mark.parametrize("efficiency", [1.0, 0.95])
 @pytest.mark.parametrize("early_slots", [1, 8])
 @pytest.mark.parametrize(
