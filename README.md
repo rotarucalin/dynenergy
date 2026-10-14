@@ -215,8 +215,9 @@ must cover the refill cost, round-trip losses, and degradation. Otherwise energy
 is held back for $T_{pre}$. The final gap, with no block after it, uses $T_{post}$.
 
 Before charging a block, DynEnergy checks later cheaper buckets. It skips the
-earlier block when a later bucket can cover the remaining deficit plus margin
-and postponing the charge preserves every intervening discharge allocation.
+earlier block when the cheaper buckets in a later block can together cover the
+remaining deficit plus margin and postponing the charge preserves every
+intervening discharge allocation.
 This keeps earlier charging when its energy is needed for a morning peak while
 allowing an unnecessary early purchase to wait for cheaper prices.
 

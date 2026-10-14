@@ -863,8 +863,8 @@ def _can_defer_block_charge(
 
     Walk future gaps with and without this block's proposed charge, using the
     same discharge allocator and each scenario's cost basis. Stop at the first
-    discharge that needs the earlier purchase. A later bucket must cover the
-    remaining deficit AND margin on its own before charging can be postponed.
+    discharge that needs the earlier purchase. The cheaper buckets in a later
+    block must together cover the remaining deficit AND margin before deferring.
     Neither simulation buys energy in intervening blocks.
     """
     if position + 1 >= len(blocks):
@@ -911,16 +911,17 @@ def _can_defer_block_charge(
             return False
 
         required_kwh = _requested_charge_kwh(battery, deferred_kwh, target_kwh)
+        cheaper_capacity_kwh = 0.0
         for bucket in _price_buckets(inputs, blocks[later_position]):
             bucket_key = floor(
                 inputs.prices_per_kwh[bucket[0]] / CHARGE_PRICE_BUCKET_WIDTH
             )
             if bucket_key >= cheapest_current_bucket:
                 break
-            if (
+            cheaper_capacity_kwh += (
                 len(bucket) * interval_energy_limit_kwh(battery.max_charge_power_kw)
-                >= required_kwh
-            ):
+            )
+            if cheaper_capacity_kwh + ENERGY_EPSILON_KWH >= required_kwh:
                 return True
     return False
 

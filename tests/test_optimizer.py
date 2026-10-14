@@ -673,6 +673,40 @@ def test_small_late_morning_dip_waits_for_midday_charging(efficiency) -> None:
     assert plan.summary.total_charge_kwh == pytest.approx(1.8 / efficiency)
 
 
+@pytest.mark.parametrize("efficiency", [1.0, 0.95])
+@pytest.mark.parametrize("early_slots", [1, 8])
+@pytest.mark.parametrize(
+    "later_prices, gap_load, defer",
+    [
+        ([0.005, 0.015, 0.025] * 2, 0.0, True),
+        ([0.005, 0.015, 0.025] * 2, 0.375, False),
+        ([0.005, 0.015, 0.055] * 2, 0.0, False),
+    ],
+)
+def test_lookahead_combines_cheaper_buckets(
+    efficiency, early_slots, later_prices, gap_load, defer,
+) -> None:
+    """Combine cheap bands without counting dearer slots or losing gap discharge."""
+    prices = [0.045] * early_slots + [0.15] + later_prices + [0.30]
+    inputs = replace(
+        _inputs(prices, current_soc_percent=19, battery=_small_battery(
+            charge_efficiency=efficiency,
+        )),
+        consumption_kwh=[0.0] * early_slots + [gap_load] + [0.0] * 7,
+    )
+    plan = create_greedy_charge_plan(inputs, CHARGE_THRESHOLD_PER_KWH)
+
+    assert any(i.state is OperatingState.CHARGE for i in plan.intervals[:early_slots]) is not defer
+    assert plan.intervals[early_slots].target_battery_energy_kwh == pytest.approx(gap_load)
+    if defer:
+        remainder = 2.02 / efficiency - 4 * 0.375
+        for interval in plan.intervals[early_slots + 1:-1]:
+            expected = 0.375 if interval.price_per_kwh < 0.02 else remainder / 2
+            assert interval.target_battery_energy_kwh == pytest.approx(-expected)
+        assert plan.intervals[-2].expected_soc_percent == pytest.approx(100)
+        assert plan.summary.total_charge_kwh == pytest.approx(1.62 / efficiency)
+
+
 @pytest.mark.parametrize(
     "refill_price, efficiency, degradation, gap_price, expected_state",
     [
